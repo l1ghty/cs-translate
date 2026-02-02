@@ -27,6 +27,10 @@ func main() {
 	flag.Parse()
 
 	scanner := bufio.NewScanner(os.Stdin)
+	if *apiKey == "" {
+		*apiKey = os.Getenv("GOOGLE_API_KEY")
+		fmt.Printf("DEBUG: Env GOOGLE_API_KEY='%s'\n", *apiKey)
+	}
 
 	if *apiKey == "" {
 		fmt.Println("Notice: No API Key provided via -apikey flag. ")
@@ -233,11 +237,36 @@ func checkCondebug(scanner *bufio.Scanner) error {
 			// Actually -condebug is a Source engine flag. Dota 2 (570) or TF2 (440) might use it.
 
 			// Refined check:
-			// Find index of "730"
+			// Find index of "730" as a section header (followed by opening brace)
 			// Find index of "LaunchOptions" AFTER "730"
 			// Check if "-condebug" is in the value of that LaunchOptions
 
-			idx730 := strings.Index(content, "\"730\"")
+			// Look for "730" followed by whitespace and opening brace to ensure it's a section header
+			// This prevents matching "730" when it appears as a value elsewhere in the file
+			idx730 := -1
+			searchPattern := "\"730\""
+			searchStart := 0
+			for {
+				idx := strings.Index(content[searchStart:], searchPattern)
+				if idx == -1 {
+					break
+				}
+				idx += searchStart
+
+				// Check if this is followed by whitespace and opening brace (section header)
+				// Skip past the closing quote
+				afterQuote := idx + len(searchPattern)
+				if afterQuote < len(content) {
+					// Look ahead for opening brace, allowing whitespace/newlines
+					remaining := content[afterQuote:]
+					trimmed := strings.TrimSpace(remaining)
+					if len(trimmed) > 0 && trimmed[0] == '{' {
+						idx730 = idx
+						break
+					}
+				}
+				searchStart = idx + 1
+			}
 			if idx730 == -1 {
 				continue
 			}

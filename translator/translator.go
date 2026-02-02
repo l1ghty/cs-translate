@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"html"
+
 	"cloud.google.com/go/translate"
 	"golang.org/x/text/language"
 	"google.golang.org/api/option"
@@ -48,7 +50,7 @@ func (t *GTranslator) Translate(ctx context.Context, text string) (string, error
 	if len(resp) == 0 {
 		return "", fmt.Errorf("translation returned no results")
 	}
-	return resp[0].Text, nil
+	return html.UnescapeString(resp[0].Text), nil
 }
 
 // Close closes the underlying client
