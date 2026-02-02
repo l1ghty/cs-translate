@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"html"
 
-	"html"
-
 	"cloud.google.com/go/translate"
 	"golang.org/x/text/language"
 	"google.golang.org/api/option"
