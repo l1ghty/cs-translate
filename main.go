@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -22,10 +23,25 @@ import (
 
 func main() {
 	logPath := flag.String("log", "", "Path to the CS2 console log file")
+	apiKey := flag.String("apikey", "", "Google Cloud Translation API Key")
 	flag.Parse()
 
+	scanner := bufio.NewScanner(os.Stdin)
+
+	if *apiKey == "" {
+		fmt.Println("Notice: No API Key provided via -apikey flag. ")
+		fmt.Println("Uses Google Cloud Translation API (Basic/v2), which provides a monthly free tier (500k characters)")
+		fmt.Print("Enter API Key (or press Enter to use Default Credentials): ")
+		if scanner.Scan() {
+			input := strings.TrimSpace(scanner.Text())
+			if input != "" {
+				*apiKey = input
+			}
+		}
+	}
+
 	// Check if -condebug is configured
-	if err := checkCondebug(); err != nil {
+	if err := checkCondebug(scanner); err != nil {
 		fmt.Printf("Warning: Could not verify launch options: %v\n", err)
 	} else {
 		// If checkCondebug returned nil, it means we either found it or prompted the user
@@ -66,7 +82,12 @@ func main() {
 	}
 	defer mon.Stop()
 
-	tr := translator.NewGTranslator()
+	ctx := context.Background()
+	tr, err := translator.NewGTranslator(ctx, *apiKey)
+	if err != nil {
+		log.Fatalf("Error creating translator: %v", err)
+	}
+	defer tr.Close()
 
 	// Handle Ctrl+C
 	c := make(chan os.Signal, 1)
@@ -90,7 +111,7 @@ func main() {
 		if msg != nil {
 			// Found a chat message
 			// Translate it
-			translated, err := tr.Translate(msg.MessageContent)
+			translated, err := tr.Translate(ctx, msg.MessageContent)
 			if err != nil {
 				log.Printf("Translation error: %v", err)
 				translated = "[Translation Pending/Error]"
@@ -152,7 +173,7 @@ func findLogFile() (string, error) {
 	return "", fmt.Errorf("could not find console.log in common locations for %s", runtime.GOOS)
 }
 
-func checkCondebug() error {
+func checkCondebug(scanner *bufio.Scanner) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -274,7 +295,6 @@ func checkCondebug() error {
 		fmt.Println("CS2 launch option '-condebug' not detected.")
 		fmt.Printf("Do you want to open Steam properties for CS2 to set it? [Y/n]: ")
 
-		scanner := bufio.NewScanner(os.Stdin)
 		if scanner.Scan() {
 			text := strings.TrimSpace(scanner.Text())
 			if text == "" || strings.ToLower(text) == "y" || strings.ToLower(text) == "yes" {
