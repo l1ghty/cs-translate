@@ -36,6 +36,8 @@ func main() {
 			input := strings.TrimSpace(scanner.Text())
 			if input != "" {
 				*apiKey = input
+			} else {
+				fmt.Println("Using Default Credentials (of your machine)")
 			}
 		}
 	}

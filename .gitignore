@@ -5,6 +5,7 @@ cs-translate.exe
 *.dll
 *.so
 *.dylib
+my-default-creds
 
 # Test binary, built with `go test -c`
 *.test
