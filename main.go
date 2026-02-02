@@ -33,6 +33,11 @@ func main() {
 	}
 
 	if *apiKey == "" {
+		*apiKey = os.Getenv("GOOGLE_API_KEY")
+		fmt.Printf("DEBUG: Env GOOGLE_API_KEY='%s'\n", *apiKey)
+	}
+
+	if *apiKey == "" {
 		fmt.Println("Notice: No API Key provided via -apikey flag. ")
 		fmt.Println("Uses Google Cloud Translation API (Basic/v2), which provides a monthly free tier (500k characters)")
 		fmt.Print("Enter API Key (or press Enter to use Default Credentials): ")
