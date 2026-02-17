@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -43,9 +44,19 @@ func NewListener() (*Listener, error) {
 	}
 
 	// Check for venv python first, then system python
-	pythonPath := filepath.Join(cwd, "venv", "bin", "python3")
+	var pythonPath string
+	if runtime.GOOS == "windows" {
+		pythonPath = filepath.Join(cwd, "venv", "Scripts", "python.exe")
+	} else {
+		pythonPath = filepath.Join(cwd, "venv", "bin", "python3")
+	}
+
 	if _, err := os.Stat(pythonPath); os.IsNotExist(err) {
-		pythonPath = "python3" // Fallback
+		if runtime.GOOS == "windows" {
+			pythonPath = "python"
+		} else {
+			pythonPath = "python3"
+		}
 	}
 
 	cmd := exec.Command(pythonPath, "-u", scriptPath) // -u for unbuffered binary stdout
@@ -103,24 +114,58 @@ func NewListener() (*Listener, error) {
 }
 
 func (l *Listener) Start(ctx context.Context, device string) error {
-	// Find pulse monitor source if "default" is specified or empty
-	source := device
-	if source == "" || source == "default" {
-		source = getDefaultMonitorSource()
-	}
-
-	log.Printf("Starting audio listener on source: %s", source)
-
-	// Start ffmpeg process
-	// Capture 5 second chunks
+	var cmd *exec.Cmd
 	pattern := filepath.Join(l.outputDir, "audio_%03d.wav")
-	cmd := exec.CommandContext(ctx, "ffmpeg",
-		"-f", "pulse", "-i", source,
-		"-f", "segment", "-segment_time", "5",
-		"-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1",
-		"-reset_timestamps", "1",
-		pattern,
-	)
+
+	if runtime.GOOS == "windows" {
+		// Windows: Use dshow
+		// If device is empty or default, we can't easily guess.
+		// "audio=Stereo Mix (Realtek High Definition Audio)" is typical for loopback if enabled.
+		// "audio=Microphone (Realtek High Definition Audio)" for mic.
+		// We will default to a generic error/warning if not specified,
+		// but let's try to support "default" if user provided nothing, which might fail or need specific handling.
+
+		inputDevice := device
+		if inputDevice == "" || inputDevice == "default" {
+			// On Windows, there is no simple "default" for dshow.
+			// Ideally we ask the user to run with -audiodevice
+			return fmt.Errorf("on Windows, you must specify the audio device name using -audiodevice. Run 'ffmpeg -list_devices true -f dshow -i dummy' to see available devices")
+		}
+
+		log.Printf("Starting audio listener on Windows device: %s", inputDevice)
+
+		// ffmpeg -f dshow -i audio="Microphone" ...
+		// If the user provided "Microphone", we format it as audio="Microphone"
+		// If they already provided audio="...", we leave it?
+		// Let's assume user provides just the name "Microphone Array"
+		// We prepend "audio="
+
+		arg := fmt.Sprintf("audio=%s", inputDevice)
+
+		cmd = exec.CommandContext(ctx, "ffmpeg",
+			"-f", "dshow", "-i", arg,
+			"-f", "segment", "-segment_time", "5",
+			"-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1",
+			"-reset_timestamps", "1",
+			pattern,
+		)
+	} else {
+		// Linux / PulseAudio
+		source := device
+		if source == "" || source == "default" {
+			source = getDefaultMonitorSource()
+		}
+
+		log.Printf("Starting audio listener on source: %s", source)
+
+		cmd = exec.CommandContext(ctx, "ffmpeg",
+			"-f", "pulse", "-i", source,
+			"-f", "segment", "-segment_time", "5",
+			"-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1",
+			"-reset_timestamps", "1",
+			pattern,
+		)
+	}
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start ffmpeg: %w", err)

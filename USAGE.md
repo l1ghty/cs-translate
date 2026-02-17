@@ -1,65 +1,78 @@
 # CS2 In-Game Translate & Voice Transcription
-
+    
 This tool translates Counter-Strike 2 chat messages in real-time and provides **local** voice chat transcription using OpenAI Whisper (running locally on your machine).
-
+    
 ## Prerequisites
-
-1.  **Go 1.24+**: Ensure Go is installed.
-2.  **FFmpeg**: Required for audio capture.
-    - Linux: `sudo apt install ffmpeg`
+    
+1.  **Go 1.24+**: Ensure Go is installed (only if building from source).
+2.  **FFmpeg**: Required on all platforms for audio capture.
+    - **Linux**: `sudo apt install ffmpeg`
+    - **Windows**: Download `ffmpeg` binaries (gyan.dev or equivalent), extract, and add the `bin` folder to your System PATH environment variable.
 3.  **Python 3.9+**: Required for running Whisper.
-    - It is recommended to use a virtual environment.
-    - `sudo apt install python3-venv` (if not already installed)
-4.  **Google Cloud Translate API Key**: Required for text translation.
-    - (API Key for Voice Transcription is NO LONGER needed as it runs locally).
-
+    - **Linux**: `sudo apt install python3-venv`
+    - **Windows**: Install Python from python.org. Ensure you check "Add Python to PATH" during installation.
+    
 ## Installation
-
-1.  Clone/Download the repository.
-2.  Setup Python environment for Whisper:
-    ```bash
-    python3 -m venv venv
-    ./venv/bin/pip install openai-whisper
-    ```
-    *Note: This might download PyTorch (~1GB) and the Whisper model on first run.*
-
-3.  Build the Go application:
-    ```bash
-    go mod tidy
-    go build -o cs-translate
-    ```
-
+    
+1.  **Setup Python environment**:
+    - **Linux**:
+      ```bash
+      python3 -m venv venv
+      ./venv/bin/pip install openai-whisper
+      ```
+    - **Windows**:
+      Open Command Prompt or PowerShell in the project folder:
+      ```cmd
+      python -m venv venv
+      .\venv\Scripts\pip install openai-whisper
+      ```
+      *Note: This might download PyTorch (~1GB) and the Whisper model on first run.*
+    
+2.  **Build or Download Binary**:
+    - **Linux**: `go build -o cs-translate`
+    - **Windows**: `go build -o cs-translate.exe` (or use the provided pre-compiled exe).
+    
+    *Ensure `transcriber.py` is in the same folder as the executable.*
+    
 ## Usage
-
-Run the tool. You will be prompted to enable Voice Transcription.
-
+    
+### Linux
+    
 ```bash
 export GOOGLE_API_KEY="your_google_key"
-./cs-translate
+./cs-translate -voice
 ```
-
-Or with flags:
-
-```bash
-./cs-translate -apikey "your_google_key" -voice
-```
-
-### Audio Device Selection
-
-By default, the tool tries to detect the monitor of your default audio output (to capture game audio including voice chat). If detection fails or you want to use a specific device:
-
-1.  List available PulseAudio sources:
-    ```bash
-    pactl list short sources
+    
+### Windows
+    
+1.  Set your API Key environment variable (optional, or pass via flag).
+2.  Run from Command Prompt / PowerShell:
+    ```cmd
+    cs-translate.exe -apikey "your_google_key" -voice -audiodevice "Microphone (Realtek High Definition Audio)"
     ```
-2.  Find the source name ending in `.monitor`.
-3.  Run with `-audiodevice`:
-    ```bash
-    ./cs-translate -audiodevice "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
+    
+**Important for Windows Audio**:
+There is no "default" audio capture on Windows via FFmpeg like on Linux. You **MUST** specify the input device name.
+    
+1.  **List Devices**:
+    Run this command in terminal to see available audio devices:
+    ```cmd
+    ffmpeg -list_devices true -f dshow -i dummy
     ```
-
+    Look for entries under "DirectShow audio devices".
+    
+2.  **Run with Device Name**:
+    If your device is named "Microphone (Realtek(R) Audio)", run:
+    ```cmd
+    cs-translate.exe -voice -audiodevice "Microphone (Realtek(R) Audio)"
+    ```
+    To capture **Game Audio** (loopback), you typically need "Stereo Mix" enabled in Windows Sound settings, or a virtual cable. If enabled, use:
+    ```cmd
+    cs-translate.exe -voice -audiodevice "Stereo Mix (Realtek(R) Audio)"
+    ```
+    
 ## Troubleshooting
-
-- **"transcriber.py not found"**: Ensure you run the `cs-translate` binary from the project root directory where `transcriber.py` resides.
-- **"openai-whisper not found"**: Ensure you installed the python dependencies in the `venv` directory or your system python.
-- **Model Loading**: The first time you enable voice, it will download the "base" Whisper model. This might take a minute.
+    
+- **"transcriber.py not found"**: Ensure `transcriber.py` is in the working directory.
+- **FFmpeg errors**: Ensure `ffmpeg` is in your PATH. Open a new terminal and type `ffmpeg -version` to check.
+- **Audio Device Error**: Double-check the name with the `ffmpeg -list_devices` command. It must match exactly.
