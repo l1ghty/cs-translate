@@ -23,6 +23,9 @@ import (
 	"github.com/micha/cs-ingame-translate/translator"
 )
 
+//go:embed transcriber.py
+var transcriberScript []byte
+
 func main() {
 	logPath := flag.String("log", "", "Path to the CS2 console log file")
 	apiKey := flag.String("apikey", "", "Google Cloud Translation API Key")
@@ -34,6 +37,9 @@ func main() {
 	// --- Google API Key Setup ---
 	if *apiKey == "" {
 		*apiKey = os.Getenv("GOOGLE_API_KEY")
+		if *apiKey == "" {
+			*apiKey = "" // provide default value
+		}
 		if *apiKey != "" {
 			fmt.Printf("DEBUG: Env GOOGLE_API_KEY found\n")
 		}
@@ -129,10 +135,24 @@ func main() {
 	// Start Audio Listener if enabled
 	var audioListener *audio.Listener
 	if *useVoice {
-		var err error
-		audioListener, err = audio.NewListener()
+		// Extract embedded transcriber script to temp file
+		tmpFile, err := os.CreateTemp("", "transcriber-*.py")
 		if err != nil {
-			log.Printf("Warning: Failed to start local audio listener: %v", err)
+			log.Fatalf("Failed to create temp file for transcriber: %v", err)
+		}
+		defer os.Remove(tmpFile.Name()) // Clean up on exit
+
+		if _, err := tmpFile.Write(transcriberScript); err != nil {
+			log.Fatalf("Failed to write transcriber script: %v", err)
+		}
+		if err := tmpFile.Close(); err != nil {
+			log.Fatalf("Failed to close temp transcriber file: %v", err)
+		}
+
+		var errListener error
+		audioListener, errListener = audio.NewListener(tmpFile.Name())
+		if errListener != nil {
+			log.Printf("Warning: Failed to start local audio listener: %v", errListener)
 			log.Println("Make sure you have python3 installed and 'pip install openai-whisper'")
 		} else {
 			if err := audioListener.Start(ctx, *audioDevice); err != nil {

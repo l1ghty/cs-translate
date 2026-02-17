@@ -29,20 +29,19 @@ type Listener struct {
 	fileQueue      chan string
 }
 
-func NewListener() (*Listener, error) {
+func NewListener(scriptPath string) (*Listener, error) {
 	tmpDir, err := os.MkdirTemp("", "cs-translate-audio")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
 
-	// Prepare python command
-	// We assume transcriber.py is in the current working directory
-	cwd, _ := os.Getwd()
-	scriptPath := filepath.Join(cwd, "transcriber.py")
+	// Verify the script exists
 	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("transcriber.py not found at %s", scriptPath)
+		return nil, fmt.Errorf("transcriber script not found at %s", scriptPath)
 	}
 
+	// Prepare python command
+	cwd, _ := os.Getwd()
 	// Check for venv python first, then system python
 	var pythonPath string
 	if runtime.GOOS == "windows" {
