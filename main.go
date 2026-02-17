@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/micha/cs-ingame-translate/audio"
 	"github.com/micha/cs-ingame-translate/monitor"
 	"github.com/micha/cs-ingame-translate/parser"
 	"github.com/micha/cs-ingame-translate/translator"
@@ -24,29 +25,47 @@ import (
 func main() {
 	logPath := flag.String("log", "", "Path to the CS2 console log file")
 	apiKey := flag.String("apikey", "", "Google Cloud Translation API Key")
+	audioDevice := flag.String("audiodevice", "", "Audio device to monitor (default: auto-detect monitor of default sink)")
 	flag.Parse()
 
 	scanner := bufio.NewScanner(os.Stdin)
+
+	// --- Google API Key Setup ---
 	if *apiKey == "" {
 		*apiKey = os.Getenv("GOOGLE_API_KEY")
-		fmt.Printf("DEBUG: Env GOOGLE_API_KEY='%s'\n", *apiKey)
+		if *apiKey != "" {
+			fmt.Printf("DEBUG: Env GOOGLE_API_KEY found\n")
+		}
 	}
 
 	if *apiKey == "" {
-		*apiKey = os.Getenv("GOOGLE_API_KEY")
-		fmt.Printf("DEBUG: Env GOOGLE_API_KEY='%s'\n", *apiKey)
-	}
-
-	if *apiKey == "" {
-		fmt.Println("Notice: No API Key provided via -apikey flag. ")
-		fmt.Println("Uses Google Cloud Translation API (Basic/v2), which provides a monthly free tier (500k characters)")
-		fmt.Print("Enter API Key (or press Enter to use Default Credentials): ")
+		fmt.Println("Notice: No Google API Key provided via -apikey flag or env.")
+		fmt.Println("Uses Google Cloud Translation API (Basic/v2).")
+		fmt.Print("Enter Google API Key (or press Enter to use Default Credentials): ")
 		if scanner.Scan() {
 			input := strings.TrimSpace(scanner.Text())
 			if input != "" {
 				*apiKey = input
 			} else {
 				fmt.Println("Using Default Credentials (of your machine)")
+			}
+		}
+	}
+
+	// --- Voice Transcription Setup ---
+	// We use local Whisper, so no API key needed.
+	// But we might want a flag to disable it?
+	useVoice := flag.Bool("voice", false, "Enable voice transcription (local Whisper)")
+
+	// If not provided in args, we can ask interactively or default to false
+	if !*useVoice {
+		// Check if user explicitly passed false? flag package defaults to false.
+		// Let's ask user.
+		fmt.Print("Enable Local Voice Transcription (requires python3 + openai-whisper)? [y/N]: ")
+		if scanner.Scan() {
+			input := strings.TrimSpace(scanner.Text())
+			if strings.ToLower(input) == "y" || strings.ToLower(input) == "yes" {
+				*useVoice = true
 			}
 		}
 	}
@@ -100,52 +119,117 @@ func main() {
 	}
 	defer tr.Close()
 
+	// Start Audio Listener if key provided
+	// Start Audio Listener if enabled
+	var audioListener *audio.Listener
+	if *useVoice {
+		var err error
+		audioListener, err = audio.NewListener()
+		if err != nil {
+			log.Printf("Warning: Failed to start local audio listener: %v", err)
+			log.Println("Make sure you have python3 installed and 'pip install openai-whisper'")
+		} else {
+			if err := audioListener.Start(ctx, *audioDevice); err != nil {
+				log.Printf("Warning: Failed to start audio capture: %v", err)
+				audioListener.Stop()
+				audioListener = nil
+			} else {
+				fmt.Println("Local Audio transcription enabled (Whisper 'base' model).")
+				defer audioListener.Stop()
+			}
+		}
+	}
+
 	// Handle Ctrl+C
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	// We handle shutdown in the main loop to ensure cleanup
 	go func() {
 		<-c
-		fmt.Println("\nStopping...")
-		mon.Stop()
-		os.Exit(0)
 	}()
 
 	fmt.Println("Waiting for chat messages...")
 
-	for line := range mon.Lines() {
-		if line.Err != nil {
-			log.Printf("Error reading line: %v", line.Err)
-			continue
-		}
+	logLines := mon.Lines()
+	var audioChan <-chan string
+	if audioListener != nil {
+		audioChan = audioListener.Transcriptions()
+	}
 
-		msg := parser.ParseLine(line.Text)
-		if msg != nil {
-			// Found a chat message
-			// Translate it
-			translated, err := tr.Translate(ctx, msg.MessageContent)
+	// Main Event Loop
+loop:
+	for {
+		select {
+		case <-c:
+			fmt.Println("\nStopping...")
+			break loop
+
+		case line, ok := <-logLines:
+			if !ok {
+				log.Println("Log monitor closed unexpectedly")
+				break loop
+			}
+			if line.Err != nil {
+				log.Printf("Error reading line: %v", line.Err)
+				continue
+			}
+
+			msg := parser.ParseLine(line.Text)
+			if msg != nil {
+				// Translate standard chat
+				translated, err := tr.Translate(ctx, msg.MessageContent)
+				if err != nil {
+					log.Printf("Translation error: %v", err)
+					translated = "[Translation Pending/Error]"
+				}
+
+				outputChat(msg.PlayerName, translated, msg.IsDead, msg.OriginalText)
+			}
+
+		case text, ok := <-audioChan:
+			if !ok {
+				audioChan = nil
+				continue
+			}
+			// Translate transcribed audio
+			// "use whisper to transcript game audio stream. output the transcripted like the chat and also translate it."
+
+			// We translate the transcribed text to target language
+			translated, err := tr.Translate(ctx, text)
 			if err != nil {
-				log.Printf("Translation error: %v", err)
-				translated = "[Translation Pending/Error]"
+				log.Printf("Translation error (voice): %v", err)
+				translated = text // Fallback to original transcription
 			}
 
-			// Format output
-			// Original line
-			fmt.Println(msg.OriginalText)
+			// "use "voice" instead of the name"
+			// We don't have IsDead status for voice, assuming alive or unknown.
+			// Format: "voice : [Translated Text]"
+			// We can also show original transcription if needed, but user said "output ... like the chat".
+			// Chat output usually shows original?
+			// The current code prints OriginalText then Translated.
+			// Let's print:
+			// "Voice Transcription: <text>"
+			// "voice : <translated>"
 
-			// Translated line with highlighting
-			// Green color for now: \033[1;32m
-			// Reset: \033[0m
-			// We reconstruct the line so it looks like the original but translated
-
-			prefix := ""
-			if msg.IsDead {
-				prefix = "*DEAD* "
-			}
-
-			// Basic reconstruction
-			fmt.Printf("\033[1;32m%s%s : %s\033[0m\n", prefix, msg.PlayerName, translated)
+			fmt.Printf("Voice: %s\n", text)
+			outputChat("voice", translated, false, "")
 		}
 	}
+}
+
+func outputChat(name, text string, isDead bool, originalLine string) {
+	if originalLine != "" {
+		fmt.Println(originalLine)
+	}
+
+	prefix := ""
+	if isDead {
+		prefix = "*DEAD* "
+	}
+
+	// Green color: \033[1;32m, Reset: \033[0m
+	fmt.Printf("\033[1;32m%s%s : %s\033[0m\n", prefix, name, text)
 }
 
 func findLogFile() (string, error) {
