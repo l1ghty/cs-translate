@@ -44,8 +44,28 @@ func EnsureEnvironment(scanner *bufio.Scanner, useVoice bool) error {
 }
 
 func checkFFmpeg() error {
-	_, err := exec.LookPath("ffmpeg")
-	return err
+	path, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		return err
+	}
+
+	// On Windows, check for WASAPI support
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command(path, "-devices")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			// If -devices isn't supported (very old ffmpeg), just warn but proceed if binary exists?
+			// but err might be exit code 0 usually.
+			// Let's assume if it fails we can't verify, but we found the binary.
+			return nil
+		}
+
+		output := string(out)
+		if !strings.Contains(strings.ToLower(output), "wasapi") {
+			fmt.Println("Warning: Installed FFmpeg does not appear to support WASAPI.")
+		}
+	}
+	return nil
 }
 
 func printManualInstallInstructions(pkg string) {
