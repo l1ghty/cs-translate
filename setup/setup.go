@@ -12,28 +12,7 @@ import (
 
 // EnsureEnvironment checks for required dependencies and offers to install them if possible
 func EnsureEnvironment(scanner *bufio.Scanner, useVoice bool) error {
-	// 1. Check FFmpeg (always required for audio capture)
-	if err := checkFFmpeg(); err != nil {
-		fmt.Println("Error: FFmpeg is required but not found in PATH.")
-
-		// Attempt auto-install
-		if err := installDependency(scanner, "ffmpeg"); err != nil {
-			fmt.Printf("Could not install FFmpeg automatically: %v\n", err)
-			printManualInstallInstructions("ffmpeg")
-			return err
-		}
-
-		// Recheck
-		if err := checkFFmpeg(); err != nil {
-			fmt.Println("Error: FFmpeg still not found after installation attempt. Please restart your shell or install manually.")
-			return err
-		}
-		fmt.Println("✔ FFmpeg installed and found.")
-	} else {
-		fmt.Println("✔ FFmpeg found.")
-	}
-
-	// 2. Setup Python environment for Voice Transcription
+	// Setup Python environment for voice transcription.
 	if useVoice {
 		if err := setupPythonEnv(scanner); err != nil {
 			return fmt.Errorf("failed to setup python environment: %w", err)
@@ -43,39 +22,8 @@ func EnsureEnvironment(scanner *bufio.Scanner, useVoice bool) error {
 	return nil
 }
 
-func checkFFmpeg() error {
-	path, err := exec.LookPath("ffmpeg")
-	if err != nil {
-		return err
-	}
-
-	// On Windows, check for WASAPI support
-	if runtime.GOOS == "windows" {
-		cmd := exec.Command(path, "-devices")
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			// If -devices isn't supported (very old ffmpeg), just warn but proceed if binary exists?
-			// but err might be exit code 0 usually.
-			// Let's assume if it fails we can't verify, but we found the binary.
-			return nil
-		}
-
-		output := string(out)
-		if !strings.Contains(strings.ToLower(output), "wasapi") {
-			fmt.Println("Warning: Installed FFmpeg does not appear to support WASAPI.")
-		}
-	}
-	return nil
-}
-
 func printManualInstallInstructions(pkg string) {
-	if pkg == "ffmpeg" {
-		if runtime.GOOS == "linux" {
-			fmt.Println("Please run: sudo apt install ffmpeg (or equivalent for your distro)")
-		} else if runtime.GOOS == "windows" {
-			fmt.Println("Please download FFmpeg from https://gyan.dev/ffmpeg/builds/ and add it to your PATH.")
-		}
-	} else if pkg == "python" {
+	if pkg == "python" {
 		fmt.Println("Please install Python 3.9+ from python.org")
 	}
 }
@@ -231,9 +179,7 @@ func detectPackageManager(pkgName string) (string, []string) {
 		if _, err := exec.LookPath("winget"); err == nil {
 			// Map generic names to Winget IDs
 			id := pkgName
-			if pkgName == "ffmpeg" {
-				id = "Gyan.FFmpeg"
-			} else if pkgName == "python" {
+			if pkgName == "python" {
 				id = "Python.Python.3.11"
 			}
 			return "winget", []string{"install", "-e", "--id", id}

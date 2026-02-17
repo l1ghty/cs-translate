@@ -132,9 +132,13 @@ func main() {
 	}
 	defer tr.Close()
 
-	// Start Audio Listener if key provided
 	// Start Audio Listener if enabled
-	var audioListener *audio.Listener
+	type transcriptionListener interface {
+		Start(context.Context, string) error
+		Stop()
+		Transcriptions() <-chan string
+	}
+	var audioListener transcriptionListener
 	if *useVoice {
 		// Extract embedded transcriber script to temp file
 		tmpFile, err := os.CreateTemp("", "transcriber-*.py")
@@ -151,7 +155,7 @@ func main() {
 		}
 
 		var errListener error
-		audioListener, errListener = audio.NewListener(tmpFile.Name())
+		audioListener, errListener = audio.NewMalgoListener(tmpFile.Name())
 		if errListener != nil {
 			log.Printf("Warning: Failed to start local audio listener: %v", errListener)
 			log.Println("Make sure you have python3 installed and 'pip install openai-whisper'")

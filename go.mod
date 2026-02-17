@@ -7,6 +7,7 @@ toolchain go1.24.12
 require (
 	cloud.google.com/go/translate v1.12.7
 	github.com/fsnotify/fsnotify v1.6.0
+	github.com/gen2brain/malgo v0.11.24
 	github.com/nxadm/tail v1.4.11
 	golang.org/x/text v0.28.0
 	google.golang.org/api v0.247.0
