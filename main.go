@@ -19,6 +19,7 @@ import (
 	"github.com/micha/cs-ingame-translate/audio"
 	"github.com/micha/cs-ingame-translate/monitor"
 	"github.com/micha/cs-ingame-translate/parser"
+	"github.com/micha/cs-ingame-translate/setup"
 	"github.com/micha/cs-ingame-translate/translator"
 )
 
@@ -68,6 +69,11 @@ func main() {
 				*useVoice = true
 			}
 		}
+	}
+
+	// --- Environment Check & Setup ---
+	if err := setup.EnsureEnvironment(scanner, *useVoice); err != nil {
+		log.Fatalf("Setup failed: %v", err)
 	}
 
 	// Check if -condebug is configured
