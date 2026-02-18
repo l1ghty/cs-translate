@@ -6,7 +6,7 @@ cs-translate.exe
 *.so
 *.dylib
 my-default-creds
-
+venv
 # Test binary, built with `go test -c`
 *.test
 
