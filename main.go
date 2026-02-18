@@ -30,8 +30,24 @@ var transcriberScript []byte
 func main() {
 	logPath := flag.String("log", "", "Path to the CS2 console log file")
 	apiKey := flag.String("apikey", "", "Google Cloud Translation API Key")
-	audioDevice := flag.String("audiodevice", "", "Audio device to monitor (default: auto-detect monitor of default sink)")
+	audioDevice := flag.String("audiodevice", "", "Audio device to monitor (default: auto-detect)")
+	listDevices := flag.Bool("list-audio-devices", false, "List available audio devices and exit")
 	flag.Parse()
+
+	// List audio devices if requested
+	if *listDevices {
+		fmt.Println(audio.GetDeviceHelpText())
+		devices, err := audio.GetAvailableDevices()
+		if err != nil {
+			fmt.Printf("Error listing devices: %v\n", err)
+		} else {
+			fmt.Println("Available audio devices:")
+			for i, device := range devices {
+				fmt.Printf("  %d. %s\n", i+1, device)
+			}
+		}
+		os.Exit(0)
+	}
 
 	scanner := bufio.NewScanner(os.Stdin)
 
@@ -154,20 +170,24 @@ func main() {
 			log.Fatalf("Failed to close temp transcriber file: %v", err)
 		}
 
-		var errListener error
-		audioListener, errListener = audio.NewMalgoListener(tmpFile.Name())
-		if errListener != nil {
-			log.Printf("Warning: Failed to start local audio listener: %v", errListener)
+		// Use FFmpeg-based audio listener
+		log.Println("Initializing FFmpeg audio capture...")
+		audioListener, err = audio.NewListener(tmpFile.Name())
+		if err != nil {
+			log.Printf("Warning: Failed to create FFmpeg audio listener: %v", err)
 			log.Println("Make sure you have python3 installed and 'pip install openai-whisper'")
+			log.Println("Also ensure ffmpeg is installed and available in your PATH")
 		} else {
 			if err := audioListener.Start(ctx, *audioDevice); err != nil {
-				log.Printf("Warning: Failed to start audio capture: %v", err)
+				log.Printf("Warning: Failed to start FFmpeg audio capture: %v", err)
 				audioListener.Stop()
 				audioListener = nil
-			} else {
-				fmt.Println("Local Audio transcription enabled (Whisper 'base' model).")
-				defer audioListener.Stop()
 			}
+		}
+
+		if audioListener != nil {
+			fmt.Println("Local Audio transcription enabled (Whisper 'base' model).")
+			defer audioListener.Stop()
 		}
 	}
 

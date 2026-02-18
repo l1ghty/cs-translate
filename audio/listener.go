@@ -117,38 +117,17 @@ func (l *Listener) Start(ctx context.Context, device string) error {
 	pattern := filepath.Join(l.outputDir, "audio_%03d.wav")
 
 	if runtime.GOOS == "windows" {
-		// Windows: Use dshow
-		// If device is empty or default, we can't easily guess.
-		// "audio=Stereo Mix (Realtek High Definition Audio)" is typical for loopback if enabled.
-		// "audio=Microphone (Realtek High Definition Audio)" for mic.
-		// We will default to a generic error/warning if not specified,
-		// but let's try to support "default" if user provided nothing, which might fail or need specific handling.
-
+		// Windows: Use virtual-audio-capturer from screen-capture-recorder
+		// https://github.com/rdp/screen-capture-recorder-to-video-windows-free
 		inputDevice := device
 		if inputDevice == "" || inputDevice == "default" {
-			// On Windows, there is no simple "default" for dshow that reliably works for everyone without configuration.
-			// We list available devices for the user.
-			devices, err := listWindowsAudioDevices()
-			msg := "On Windows, you must specify the audio device name using -audiodevice.\n"
-			if err == nil && devices != "" {
-				msg += "Available Devices:\n" + devices
-			} else {
-				msg += "Could not list devices automatically. Run 'ffmpeg -list_devices true -f dshow -i dummy' to see them."
-			}
-			return fmt.Errorf("%s", msg)
+			inputDevice = "virtual-audio-capturer"
 		}
 
 		log.Printf("Starting audio listener on Windows device: %s", inputDevice)
 
-		// If the user provided "Microphone", we format it as audio="Microphone"
-		// We prepend "audio=" if not present (simple heuristic)
-		arg := inputDevice
-		if !strings.HasPrefix(arg, "audio=") {
-			arg = fmt.Sprintf("audio=%s", inputDevice)
-		}
-
 		cmd = exec.CommandContext(ctx, "ffmpeg",
-			"-f", "dshow", "-i", arg,
+			"-f", "dshow", "-i", fmt.Sprintf("audio=%s", inputDevice),
 			"-f", "segment", "-segment_time", "5",
 			"-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1",
 			"-reset_timestamps", "1",
@@ -290,73 +269,4 @@ func getDefaultMonitorSource() string {
 		}
 	}
 	return "default.monitor"
-}
-
-func listWindowsAudioDevices() (string, error) {
-	// ffmpeg -list_devices true -f dshow -i dummy
-	// This command usually returns exit code 1 because "dummy" input fails,
-	// but the device list is printed to stderr.
-	cmd := exec.Command("ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy")
-	// We combine stdout/stderr because it prints to stderr
-	out, _ := cmd.CombinedOutput()
-	output := string(out)
-
-	// Parse the output to be friendlier?
-	// Output format is usually: [dshow @ ...]  "Device Name"
-	// Let's just return the raw output relevant lines to keep it simple but filter a bit.
-	var result strings.Builder
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	printing := false
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.Contains(line, "DirectShow audio devices") {
-			printing = true
-			continue
-		}
-		if strings.Contains(line, "DirectShow video devices") {
-			printing = false
-		}
-		if printing {
-			// Filter out internal ffmpeg logs
-			if strings.Contains(line, "]  \"") {
-				// Line looks like: [dshow @ 0000...]  "Microphone (Realtek Audio)"
-				// We want to extract just the name to show clearly, or keep the line.
-				// Let's keep the line but maybe trim the prefix?
-				parts := strings.SplitN(line, "] ", 2)
-				if len(parts) == 2 {
-					result.WriteString(" - " + strings.TrimSpace(parts[1]) + "\n")
-				}
-			}
-		}
-	}
-
-	// If dshow found nothing, try WASAPI
-	if result.Len() == 0 {
-		cmd = exec.Command("ffmpeg", "-list_devices", "true", "-f", "wasapi", "-i", "dummy")
-		out, _ = cmd.CombinedOutput()
-		output = string(out) // wasapi output
-
-		scanner = bufio.NewScanner(strings.NewReader(output))
-		// For WASAPI, it usually lists devices directly
-		// Example: [wasapi @ ...] "Microphone (Realtek Audio)"
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.Contains(line, "]  \"") {
-				parts := strings.SplitN(line, "] ", 2)
-				if len(parts) == 2 {
-					name := strings.TrimSpace(parts[1])
-					// WASAPI devices often look like "Microphone (Realtek Audio)" or "Output (Realtek Audio)"
-					// We only want input devices usually? WASAPI lists both.
-					// But let's list all for now.
-					result.WriteString(" - (WASAPI) " + name + "\n")
-				}
-			}
-		}
-	}
-
-	if result.Len() == 0 {
-		return output, nil // Fallback to raw output of last attempt
-	}
-
-	return result.String(), nil
 }
