@@ -4,11 +4,6 @@ This tool translates Counter-Strike 2 chat messages in real-time and provides **
 
 ## Prerequisites
 
-### Required (will be installed automatically if missing)
-- **Ollama**: Install from https://ollama.ai and ensure it's running
-- **Python 3.9+**: For Whisper transcription
-- **FFmpeg**: Required for audio capture
-
 ### Windows additional dependencies
 #### Windows Audio Device Selection:
 - Requires: https://github.com/rdp/screen-capture-recorder-to-video-windows-free
@@ -17,18 +12,23 @@ This tool translates Counter-Strike 2 chat messages in real-time and provides **
 ### Automatic Setup
 The tool includes automatic dependency installation. If dependencies are missing, it will offer to set them up.
 
+#### Dependencies Will be installed automatically if missing
+- **Ollama**: Install from https://ollama.ai and ensure it's running
+- **Python 3.9+**: For Whisper transcription
+- **FFmpeg**: Required for audio capture
+
 ## Usage
 
 ### Quick Start
 
 **Linux/macOS:**
 ```bash
-./cs-translate
+./cs-translate --lang Spanish # Defaults to English if no language specified
 ```
 
 **Windows:**
 ```cmd
-cs-translate.exe
+cs-translate.exe -lang Spanish # Defaults to English if no language specified
 ```
 
 ### Command Line Options
