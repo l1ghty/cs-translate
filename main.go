@@ -164,7 +164,7 @@ func main() {
 		}
 
 		if audioListener != nil {
-			fmt.Println("Local Audio transcription enabled (Whisper 'base' model).")
+			fmt.Printf("Local Audio transcription enabled (Whisper '%s' model).\n", translator.DefaultWhisperModel)
 			defer audioListener.Stop()
 		}
 	}

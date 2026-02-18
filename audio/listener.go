@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/micha/cs-ingame-translate/translator"
 )
 
 type Listener struct {
@@ -73,6 +74,9 @@ func NewListener(scriptPath string) (*Listener, error) {
 
 	// Redirect stderr to our stderr for debugging
 	cmd.Stderr = os.Stderr
+
+	// Set Whisper model via environment variable
+	cmd.Env = append(os.Environ(), fmt.Sprintf("WHISPER_MODEL=%s", getWhisperModel()))
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start transcriber.py: %w", err)
@@ -269,4 +273,8 @@ func getDefaultMonitorSource() string {
 		}
 	}
 	return "default.monitor"
+}
+
+func getWhisperModel() string {
+	return translator.DefaultWhisperModel
 }

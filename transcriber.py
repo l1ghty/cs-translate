@@ -20,10 +20,11 @@ def main():
         sys.exit(1)
 
     # Print to stderr so main program can differentiate logs from data
-    print("Loading Whisper model 'base'...", file=sys.stderr)
-    
+    whisper_model = os.environ.get("WHISPER_MODEL", "base")
+    print(f"Loading Whisper model '{whisper_model}'...", file=sys.stderr)
+
     try:
-        model = whisper.load_model("base")
+        model = whisper.load_model(whisper_model)
         print("Whisper model loaded.", file=sys.stderr)
     except Exception as e:
         print(f"Failed to load model: {e}", file=sys.stderr)
