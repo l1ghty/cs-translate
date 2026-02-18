@@ -9,6 +9,11 @@ This tool translates Counter-Strike 2 chat messages in real-time and provides **
 - **Python 3.9+**: For Whisper transcription
 - **FFmpeg**: Required for audio capture
 
+### Windows additional dependencies
+#### Windows Audio Device Selection:
+- Requires: https://github.com/rdp/screen-capture-recorder-to-video-windows-free
+- No device selection needed - app uses virtual-audio-capturer by default
+
 ### Automatic Setup
 The tool includes automatic dependency installation. If dependencies are missing, it will offer to set them up.
 
