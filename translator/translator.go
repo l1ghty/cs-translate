@@ -1,13 +1,15 @@
 package translator
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"html"
-
-	"cloud.google.com/go/translate"
-	"golang.org/x/text/language"
-	"google.golang.org/api/option"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"time"
 )
 
 // Translator defines the interface for translating text
@@ -16,43 +18,120 @@ type Translator interface {
 	Close() error
 }
 
-// GTranslator implements Translator using Google Cloud Translation API
-type GTranslator struct {
-	client     *translate.Client
-	targetLang language.Tag
+// OllamaTranslator implements Translator using local Ollama LLM
+type OllamaTranslator struct {
+	httpClient *http.Client
+	baseURL    string
+	model      string
+	targetLang string
 }
 
-// NewGTranslator creates a new translator
-func NewGTranslator(ctx context.Context, apiKey string) (*GTranslator, error) {
-	var opts []option.ClientOption
-	if apiKey != "" {
-		opts = append(opts, option.WithAPIKey(apiKey))
+// OllamaRequest represents the request body for Ollama API
+type OllamaRequest struct {
+	Model   string `json:"model"`
+	Prompt  string `json:"prompt"`
+	Stream  bool   `json:"stream"`
+	Options struct {
+		Temperature float64 `json:"temperature"`
+	} `json:"options,omitempty"`
+}
+
+// OllamaResponse represents the response from Ollama API
+type OllamaResponse struct {
+	Model    string `json:"model"`
+	Response string `json:"response"`
+	Done     bool   `json:"done"`
+	Error    string `json:"error,omitempty"`
+}
+
+// NewOllamaTranslator creates a new Ollama translator
+func NewOllamaTranslator(ctx context.Context, model, targetLang string) (*OllamaTranslator, error) {
+	baseURL := os.Getenv("OLLAMA_HOST")
+	if baseURL == "" {
+		baseURL = "http://localhost:11434"
 	}
 
-	client, err := translate.NewClient(ctx, opts...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create translate client: %v", err)
+	if model == "" {
+		model = "llama3.2" // Default lightweight model
 	}
 
-	return &GTranslator{
-		client:     client,
-		targetLang: language.English,
+	if targetLang == "" {
+		targetLang = "English"
+	}
+
+	return &OllamaTranslator{
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+		baseURL:    baseURL,
+		model:      model,
+		targetLang: targetLang,
 	}, nil
 }
 
-// Translate translates the text to English
-func (t *GTranslator) Translate(ctx context.Context, text string) (string, error) {
-	resp, err := t.client.Translate(ctx, []string{text}, t.targetLang, nil)
+// Translate translates the text to the target language using Ollama
+func (t *OllamaTranslator) Translate(ctx context.Context, text string) (string, error) {
+	// Skip translation for very short or non-text content
+	text = strings.TrimSpace(text)
+	if text == "" || len(text) < 2 {
+		return text, nil
+	}
+
+	// Build the translation prompt
+	prompt := fmt.Sprintf("Translate the following text to %s. Output ONLY the translation, nothing else:\n\n%s", t.targetLang, text)
+
+	reqBody := OllamaRequest{
+		Model:  t.model,
+		Prompt: prompt,
+		Stream: false,
+	}
+	reqBody.Options.Temperature = 0.3 // Low temperature for consistent translations
+
+	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to marshal request: %v", err)
 	}
-	if len(resp) == 0 {
-		return "", fmt.Errorf("translation returned no results")
+
+	url := fmt.Sprintf("%s/api/generate", t.baseURL)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %v", err)
 	}
-	return html.UnescapeString(resp[0].Text), nil
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %v", err)
+	}
+
+	var ollamaResp OllamaResponse
+	if err := json.Unmarshal(body, &ollamaResp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %v", err)
+	}
+
+	if ollamaResp.Error != "" {
+		return "", fmt.Errorf("ollama error: %s", ollamaResp.Error)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ollama API returned status %d: %s", resp.StatusCode, ollamaResp.Response)
+	}
+
+	translation := strings.TrimSpace(ollamaResp.Response)
+	if translation == "" {
+		return text, nil // Return original if translation is empty
+	}
+
+	return translation, nil
 }
 
-// Close closes the underlying client
-func (t *GTranslator) Close() error {
-	return t.client.Close()
+// Close cleans up resources (no-op for Ollama)
+func (t *OllamaTranslator) Close() error {
+	return nil
 }

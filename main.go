@@ -29,7 +29,8 @@ var transcriberScript []byte
 
 func main() {
 	logPath := flag.String("log", "", "Path to the CS2 console log file")
-	apiKey := flag.String("apikey", "", "Google Cloud Translation API Key")
+	ollamaModel := flag.String("model", "llama3.2", "Ollama model to use for translation")
+	targetLang := flag.String("lang", "English", "Target language for translation")
 	audioDevice := flag.String("audiodevice", "", "Audio device to monitor (default: auto-detect)")
 	listDevices := flag.Bool("list-audio-devices", false, "List available audio devices and exit")
 	flag.Parse()
@@ -50,31 +51,6 @@ func main() {
 	}
 
 	scanner := bufio.NewScanner(os.Stdin)
-
-	// --- Google API Key Setup ---
-	if *apiKey == "" {
-		*apiKey = os.Getenv("GOOGLE_API_KEY")
-		if *apiKey == "" {
-			*apiKey = "" // provide default value
-		}
-		if *apiKey != "" {
-			fmt.Printf("DEBUG: Env GOOGLE_API_KEY found\n")
-		}
-	}
-
-	if *apiKey == "" {
-		fmt.Println("Notice: No Google API Key provided via -apikey flag or env.")
-		fmt.Println("Uses Google Cloud Translation API (Basic/v2).")
-		fmt.Print("Enter Google API Key (or press Enter to use Default Credentials): ")
-		if scanner.Scan() {
-			input := strings.TrimSpace(scanner.Text())
-			if input != "" {
-				*apiKey = input
-			} else {
-				fmt.Println("Using Default Credentials (of your machine)")
-			}
-		}
-	}
 
 	// --- Voice Transcription Setup ---
 	// We use local Whisper, so no API key needed.
@@ -142,11 +118,13 @@ func main() {
 	defer mon.Stop()
 
 	ctx := context.Background()
-	tr, err := translator.NewGTranslator(ctx, *apiKey)
+	tr, err := translator.NewOllamaTranslator(ctx, *ollamaModel, *targetLang)
 	if err != nil {
 		log.Fatalf("Error creating translator: %v", err)
 	}
 	defer tr.Close()
+
+	fmt.Printf("Using Ollama model '%s' for translation to %s\n", *ollamaModel, *targetLang)
 
 	// Start Audio Listener if enabled
 	type transcriptionListener interface {
