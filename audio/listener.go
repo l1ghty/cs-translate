@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -216,6 +217,12 @@ func (l *Listener) worker() {
 		// Wait a bit ensuring file closed
 		time.Sleep(100 * time.Millisecond)
 
+		// Check if audio is silent before transcribing
+		if l.isSilent(path) {
+			os.Remove(path)
+			continue
+		}
+
 		// Start timing for transcription
 		transcribeStart := time.Now()
 
@@ -284,4 +291,34 @@ func getDefaultMonitorSource() string {
 
 func getWhisperModel() string {
 	return translator.DefaultWhisperModel
+}
+
+func (l *Listener) isSilent(path string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-i", path,
+		"-af", "volumedetect",
+		"-f", "null", "-",
+	)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+
+	output := string(out)
+
+	if idx := strings.Index(output, "mean_volume:"); idx != -1 {
+		volumeStr := output[idx+12:]
+		if end := strings.Index(volumeStr, " dB"); end != -1 {
+			volumeStr = volumeStr[:end]
+			if vol, err := strconv.ParseFloat(strings.TrimSpace(volumeStr), 64); err == nil {
+				return vol < -50
+			}
+		}
+	}
+
+	return false
 }
