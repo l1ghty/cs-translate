@@ -283,8 +283,8 @@ loop:
 			}
 
 			// Display with timing: "Voice: <text> [transcribe: X.XXs, translate: X.XXs]"
-			fmt.Printf("Voice: %s [transcribe: %.2fs, translate: %.2fs]\n", transcribedText, transcribeDuration, translateDuration.Seconds())
-			outputChat("voice", translated, false, "")
+			fmt.Printf("Voice %.2fs: %s \n", transcribeDuration, transcribedText)
+			outputChat(fmt.Sprintf("voice %.2fs: ", translateDuration.Seconds()), translated, false, "")
 		}
 	}
 }
