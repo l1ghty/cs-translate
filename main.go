@@ -29,7 +29,7 @@ var transcriberScript []byte
 
 func main() {
 	logPath := flag.String("log", "", "Path to the CS2 console log file")
-	ollamaModel := flag.String("model", "llama3.2", "Ollama model to use for translation")
+	ollamaModel := flag.String("model", "qwen3:0.6b", "Ollama model to use for translation")
 	targetLang := flag.String("lang", "English", "Target language for translation")
 	audioDevice := flag.String("audiodevice", "", "Audio device to monitor (default: auto-detect)")
 	listDevices := flag.Bool("list-audio-devices", false, "List available audio devices and exit")

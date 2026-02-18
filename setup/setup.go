@@ -78,7 +78,7 @@ func setupOllama(scanner *bufio.Scanner) error {
 	}
 
 	// Check and pull the model
-	model := "llama3.2"
+	model := "qwen3:0.6b"
 	fmt.Printf("Checking for Ollama model '%s'...\n", model)
 	if err := checkAndPullModel(scanner, model); err != nil {
 		return err

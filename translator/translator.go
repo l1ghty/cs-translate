@@ -52,7 +52,7 @@ func NewOllamaTranslator(ctx context.Context, model, targetLang string) (*Ollama
 	}
 
 	if model == "" {
-		model = "llama3.2" // Default lightweight model
+		model = "qwen3:0.6b" // Default lightweight model for translation
 	}
 
 	if targetLang == "" {
@@ -131,7 +131,35 @@ func (t *OllamaTranslator) Translate(ctx context.Context, text string) (string, 
 	return translation, nil
 }
 
-// Close cleans up resources (no-op for Ollama)
+// Close cleans up resources and unloads the model
 func (t *OllamaTranslator) Close() error {
+	// Unload the model from memory
+	url := fmt.Sprintf("%s/api/generate", t.baseURL)
+	reqBody := map[string]interface{}{
+		"model":      t.model,
+		"prompt":     "",
+		"stream":     false,
+		"keep_alive": 0, // Unload immediately
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal unload request: %v", err)
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create unload request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		// Don't fail if model is already unloaded or server is down
+		return nil
+	}
+	defer resp.Body.Close()
+
 	return nil
 }
