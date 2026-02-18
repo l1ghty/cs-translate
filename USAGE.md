@@ -1,41 +1,58 @@
 # CS2 In-Game Translate & Voice Transcription
-    
-This tool translates Counter-Strike 2 chat messages in real-time and provides **local** voice chat transcription using OpenAI Whisper.
-    
-## Prerequisites & Installation
 
-The tool includes **automatic dependency installation**!
+This tool translates Counter-Strike 2 chat messages in real-time and provides **local** voice chat transcription using OpenAI Whisper and Ollama for translation.
 
-### Linux
-1.  **Run**:
-    ```bash
-    export GOOGLE_API_KEY="your_google_key"
-    ./cs-translate -voice
-    ```
-2.  **Auto-Setup**:
-    - If `python` is missing, it will offer to install it.
-    - It will automatically set up the Python virtual environment and dependencies.
+## Prerequisites
 
-### Windows
-1.  **Run**:
-    ```cmd
-    cs-translate.exe -apikey "your_google_key" -voice -audiodevice "Stereo Mix (Realtek(R) Audio)"
-    ```
-2.  **Auto-Setup**:
-    - If `python` is missing, it will offer to install it (Python 3.11 via Winget).
-    - It will automatically set up the Python virtual environment and dependencies.
+### Required (will be installed automatically if missing)
+- **Ollama**: Install from https://ollama.ai and ensure it's running
+- **Python 3.9+**: For Whisper transcription
+- **FFmpeg**: Required for audio capture
 
-## Manual Dependencies (if auto-setup fails)
+### Automatic Setup
+The tool includes automatic dependency installation. If dependencies are missing, it will offer to set them up.
 
-- **Python 3.9+**: https://python.org
+## Usage
 
-## Windows Audio Note
+### Quick Start
 
-Audio capture uses native `malgo` loopback. You can run with the default output device:
+**Linux/macOS:**
+```bash
+./cs-translate
+```
 
-1.  **Run**: `cs-translate.exe -voice`
-2.  **Optional Device Selection**: `cs-translate.exe -voice -audiodevice "Speakers"`
-    
-## Troubleshooting
-    
-- **"transcriber.py not found"**: Ensure `transcriber.py` is in the working directory.
+**Windows:**
+```cmd
+cs-translate.exe
+```
+
+### Command Line Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-voice` | Enable voice transcription (local Whisper) |
+| `-log` | Path to CS2 console log file | Auto-detect |
+| `-model` | Ollama model for translation | `hf.co/blackcloud1199/qwen-translation-vi` |
+| `-lang` | Target language for translation | `English` |
+| `-audiodevice` | Audio device for voice capture | Auto-detect |
+| `-list-audio-devices` | List available audio devices and exit | - |
+
+### Examples
+
+**With custom Ollama model:**
+```bash
+./cs-translate -model llama3 -lang Spanish -voice
+```
+
+**Specify log file manually:**
+```bash
+./cs-translate -log /path/to/console.log
+```
+
+## Features
+
+- **Chat Translation**: Translates in-game chat messages to your target language using local Ollama LLM
+- **Voice Transcription**: Captures and transcribes voice chat using Whisper (local, privacy-friendly)
+- **Auto Log Detection**: Automatically finds the CS2 console.log file
+- **Voice Context**: Provides last 10 seconds of transcription context for better translation accuracy
+
