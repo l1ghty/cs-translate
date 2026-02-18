@@ -44,6 +44,11 @@ type OllamaResponse struct {
 	Error    string `json:"error,omitempty"`
 }
 
+// VoiceContext represents recent transcription context for voice translation
+type VoiceContext struct {
+	ContextText string // Recent transcriptions from last 10 seconds
+}
+
 // NewOllamaTranslator creates a new Ollama translator
 func NewOllamaTranslator(ctx context.Context, model, targetLang string) (*OllamaTranslator, error) {
 	baseURL := os.Getenv("OLLAMA_HOST")
@@ -126,6 +131,77 @@ func (t *OllamaTranslator) Translate(ctx context.Context, text string) (string, 
 	translation := strings.TrimSpace(ollamaResp.Response)
 	if translation == "" {
 		return text, nil // Return original if translation is empty
+	}
+
+	return translation, nil
+}
+
+// TranslateWithContext translates text with additional context from recent transcriptions
+func (t *OllamaTranslator) TranslateWithContext(ctx context.Context, text string, context VoiceContext) (string, error) {
+	text = strings.TrimSpace(text)
+	if text == "" || len(text) < 2 {
+		return text, nil
+	}
+
+	// Build the translation prompt with context
+	var prompt string
+	if context.ContextText != "" {
+		prompt = fmt.Sprintf(`Context from recent speech (last 10 seconds):
+%s
+
+Translate the following text to %s. Use the context above to understand the conversation topic and provide a more accurate translation. Output ONLY the translation, nothing else:
+
+%s`, context.ContextText, t.targetLang, text)
+	} else {
+		prompt = fmt.Sprintf("Translate the following text to %s. Output ONLY the translation, nothing else:\n\n%s", t.targetLang, text)
+	}
+
+	reqBody := OllamaRequest{
+		Model:  t.model,
+		Prompt: prompt,
+		Stream: false,
+	}
+	reqBody.Options.Temperature = 0.3
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %v", err)
+	}
+
+	url := fmt.Sprintf("%s/api/generate", t.baseURL)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %v", err)
+	}
+
+	var ollamaResp OllamaResponse
+	if err := json.Unmarshal(body, &ollamaResp); err != nil {
+		return "", fmt.Errorf("failed to parse response: %v", err)
+	}
+
+	if ollamaResp.Error != "" {
+		return "", fmt.Errorf("ollama error: %s", ollamaResp.Error)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ollama API returned status %d: %s", resp.StatusCode, ollamaResp.Response)
+	}
+
+	translation := strings.TrimSpace(ollamaResp.Response)
+	if translation == "" {
+		return text, nil
 	}
 
 	return translation, nil

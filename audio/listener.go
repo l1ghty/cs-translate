@@ -119,6 +119,8 @@ func NewListener(scriptPath string) (*Listener, error) {
 func (l *Listener) Start(ctx context.Context, device string) error {
 	var cmd *exec.Cmd
 	pattern := filepath.Join(l.outputDir, "audio_%03d.wav")
+	//segment_time
+	segmentTime := "2"
 
 	if runtime.GOOS == "windows" {
 		// Windows: Use virtual-audio-capturer from screen-capture-recorder
@@ -132,7 +134,7 @@ func (l *Listener) Start(ctx context.Context, device string) error {
 
 		cmd = exec.CommandContext(ctx, "ffmpeg",
 			"-f", "dshow", "-i", fmt.Sprintf("audio=%s", inputDevice),
-			"-f", "segment", "-segment_time", "5",
+			"-f", "segment", "-segment_time", segmentTime,
 			"-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1",
 			"-reset_timestamps", "1",
 			pattern,
@@ -148,7 +150,7 @@ func (l *Listener) Start(ctx context.Context, device string) error {
 
 		cmd = exec.CommandContext(ctx, "ffmpeg",
 			"-f", "pulse", "-i", source,
-			"-f", "segment", "-segment_time", "5",
+			"-f", "segment", "-segment_time", segmentTime,
 			"-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1",
 			"-reset_timestamps", "1",
 			pattern,
@@ -214,6 +216,9 @@ func (l *Listener) worker() {
 		// Wait a bit ensuring file closed
 		time.Sleep(100 * time.Millisecond)
 
+		// Start timing for transcription
+		transcribeStart := time.Now()
+
 		// Send to python
 		// We hold a lock just in case, though this is the only writer
 		l.mu.Lock()
@@ -229,8 +234,10 @@ func (l *Listener) worker() {
 		// Assuming strict 1:1 request/response
 		if l.pythonStdout.Scan() {
 			text := strings.TrimSpace(l.pythonStdout.Text())
+			transcribeDuration := time.Since(transcribeStart)
 			if text != "" {
-				l.transcriptions <- text
+				// Include timing with transcription
+				l.transcriptions <- fmt.Sprintf("%s|%.2f", text, transcribeDuration.Seconds())
 			}
 		} else {
 			if err := l.pythonStdout.Err(); err != nil {

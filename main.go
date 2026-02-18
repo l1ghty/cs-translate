@@ -186,6 +186,13 @@ func main() {
 		audioChan = audioListener.Transcriptions()
 	}
 
+	// Voice context buffer for last 10 seconds of transcriptions
+	type voiceTranscription struct {
+		text      string
+		timestamp time.Time
+	}
+	var voiceContext []voiceTranscription
+
 	// Main Event Loop
 loop:
 	for {
@@ -221,27 +228,62 @@ loop:
 				audioChan = nil
 				continue
 			}
-			// Translate transcribed audio
-			// "use whisper to transcript game audio stream. output the transcripted like the chat and also translate it."
 
-			// We translate the transcribed text to target language
-			translated, err := tr.Translate(ctx, text)
-			if err != nil {
-				log.Printf("Translation error (voice): %v", err)
-				translated = text // Fallback to original transcription
+			// Parse transcription and timing (format: "text|duration")
+			transcribeDuration := 0.0
+			transcribedText := text
+			if idx := strings.LastIndex(text, "|"); idx != -1 {
+				if duration, err := fmt.Sscanf(text[idx+1:], "%f", &transcribeDuration); err == nil && duration == 1 {
+					transcribedText = text[:idx]
+				}
 			}
 
-			// "use "voice" instead of the name"
-			// We don't have IsDead status for voice, assuming alive or unknown.
-			// Format: "voice : [Translated Text]"
-			// We can also show original transcription if needed, but user said "output ... like the chat".
-			// Chat output usually shows original?
-			// The current code prints OriginalText then Translated.
-			// Let's print:
-			// "Voice Transcription: <text>"
-			// "voice : <translated>"
+			// Add to voice context buffer
+			now := time.Now()
+			voiceContext = append(voiceContext, voiceTranscription{text: transcribedText, timestamp: now})
 
-			fmt.Printf("Voice: %s\n", text)
+			// Clean up old entries (older than 10 seconds)
+			cutoff := now.Add(-10 * time.Second)
+			validIdx := 0
+			for i, v := range voiceContext {
+				if v.timestamp.After(cutoff) {
+					validIdx = i
+					break
+				}
+			}
+			if validIdx > 0 {
+				voiceContext = voiceContext[validIdx:]
+			}
+
+			// Build context string from recent transcriptions (excluding current)
+			var contextText strings.Builder
+			for _, v := range voiceContext[:len(voiceContext)-1] {
+				if contextText.Len() > 0 {
+					contextText.WriteString("\n")
+				}
+				contextText.WriteString(v.text)
+			}
+
+			// Measure translation time
+			translateStart := time.Now()
+
+			// Translate with context if available
+			var translated string
+			var err error
+			if contextText.Len() > 0 {
+				translated, err = tr.TranslateWithContext(ctx, transcribedText, translator.VoiceContext{ContextText: contextText.String()})
+			} else {
+				translated, err = tr.Translate(ctx, transcribedText)
+			}
+			translateDuration := time.Since(translateStart)
+
+			if err != nil {
+				log.Printf("Translation error (voice): %v", err)
+				translated = transcribedText // Fallback to original transcription
+			}
+
+			// Display with timing: "Voice: <text> [transcribe: X.XXs, translate: X.XXs]"
+			fmt.Printf("Voice: %s [transcribe: %.2fs, translate: %.2fs]\n", transcribedText, transcribeDuration, translateDuration.Seconds())
 			outputChat("voice", translated, false, "")
 		}
 	}
