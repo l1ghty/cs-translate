@@ -2,6 +2,7 @@ package setup
 
 import (
 	"bufio"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,12 @@ import (
 	"github.com/micha/cs-ingame-translate/translator"
 )
 
+//go:embed Dockerfile
+var dockerfileContent []byte
+
+//go:embed transcriber.py
+var transcriberScript []byte
+
 // EnsureEnvironment checks for required dependencies and offers to install them if possible
 func EnsureEnvironment(scanner *bufio.Scanner, useVoice bool) error {
 	// Setup Ollama for translation
@@ -23,13 +30,26 @@ func EnsureEnvironment(scanner *bufio.Scanner, useVoice bool) error {
 		return fmt.Errorf("failed to setup Ollama: %w", err)
 	}
 
-	// Setup Python environment for voice transcription.
+	// Handle voice transcription setup
 	if useVoice {
-		if err := setupPythonEnv(scanner); err != nil {
-			return fmt.Errorf("failed to setup python environment: %w", err)
+		// Default to Docker if USE_DOCKER_WHISPER is not explicitly set to "0"
+		if os.Getenv("USE_DOCKER_WHISPER") != "0" {
+			fmt.Println("Using Docker for Whisper transcription (already running in unified container)")
+		} else {
+			if err := setupPythonEnv(scanner); err != nil {
+				return fmt.Errorf("failed to setup python environment: %w", err)
+			}
 		}
 	}
 
+	return nil
+}
+
+func checkDocker() error {
+	cmd := exec.Command("docker", "ps")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker is not running or not installed: %w", err)
+	}
 	return nil
 }
 
@@ -42,6 +62,11 @@ type OllamaVersionResponse struct {
 func setupOllama(scanner *bufio.Scanner) error {
 	fmt.Println("Checking Ollama installation...")
 
+	// Default to Docker if USE_DOCKER_OLLAMA is not explicitly set to "0"
+	if os.Getenv("USE_DOCKER_OLLAMA") != "0" {
+		return setupDockerContainer(scanner)
+	}
+
 	// Check if Ollama is running
 	ollamaURL := "http://localhost:11434"
 	if envURL := os.Getenv("OLLAMA_HOST"); envURL != "" {
@@ -53,7 +78,8 @@ func setupOllama(scanner *bufio.Scanner) error {
 	if err != nil {
 		fmt.Printf("Ollama is not running or not accessible at %s\n", ollamaURL)
 		fmt.Println("Ollama is required for translation.")
-		fmt.Print("Do you want to install Ollama? [Y/n]: ")
+		fmt.Println("you can set USE_DOCKER_OLLAMA=0 for no isolation in docker (more performant).")
+		fmt.Print("Do you want to install Ollama (with docker)? [Y/n]: ")
 		if scanner.Scan() {
 			input := strings.TrimSpace(scanner.Text())
 			if input == "" || strings.ToLower(input) == "y" || strings.ToLower(input) == "yes" {
@@ -84,6 +110,171 @@ func setupOllama(scanner *bufio.Scanner) error {
 	fmt.Printf("Checking for Ollama model '%s'...\n", model)
 	if err := checkAndPullModel(scanner, model); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// setupDockerContainer sets up the unified Docker container with Ollama and Whisper
+func setupDockerContainer(scanner *bufio.Scanner) error {
+	fmt.Println("Setting up Docker container with Ollama and Whisper...")
+
+	if err := checkDocker(); err != nil {
+		return fmt.Errorf("docker is required: %w", err)
+	}
+
+	containerName := "cs-translate"
+
+	// Check if container is already running
+	checkCmd := exec.Command("docker", "ps", "--filter", "name="+containerName, "--format", "{{.Names}}")
+	output, err := checkCmd.Output()
+	if err == nil && strings.TrimSpace(string(output)) == containerName {
+		fmt.Println("Docker container already running")
+	} else {
+		// Check if container exists but stopped
+		checkCmd = exec.Command("docker", "ps", "-a", "--filter", "name="+containerName, "--format", "{{.Names}}")
+		output, err = checkCmd.Output()
+		if err == nil && strings.TrimSpace(string(output)) == containerName {
+			fmt.Println("Starting existing Docker container...")
+			startCmd := exec.Command("docker", "start", containerName)
+			startCmd.Stdout = os.Stdout
+			startCmd.Stderr = os.Stderr
+			if err := startCmd.Run(); err != nil {
+				return fmt.Errorf("failed to start container: %w", err)
+			}
+		} else {
+			// Build and start new container
+			fmt.Println("Building Docker container (first time only, this may take a few minutes)...")
+
+			// Create temp directory for build context
+			tmpDir, err := os.MkdirTemp("", "cs-translate-docker")
+			if err != nil {
+				return fmt.Errorf("failed to create temp dir: %w", err)
+			}
+			defer os.RemoveAll(tmpDir)
+
+			// Write Dockerfile
+			if err := os.WriteFile(filepath.Join(tmpDir, "Dockerfile"), dockerfileContent, 0644); err != nil {
+				return fmt.Errorf("failed to write Dockerfile: %w", err)
+			}
+
+			// Write transcriber.py
+			if err := os.WriteFile(filepath.Join(tmpDir, "transcriber.py"), transcriberScript, 0644); err != nil {
+				return fmt.Errorf("failed to write transcriber.py: %w", err)
+			}
+
+			// Build the image
+			buildCmd := exec.Command("docker", "build", "-t", "cs-translate:latest", ".")
+			buildCmd.Dir = tmpDir
+			buildCmd.Stdout = os.Stdout
+			buildCmd.Stderr = os.Stderr
+			if err := buildCmd.Run(); err != nil {
+				return fmt.Errorf("failed to build docker image: %w", err)
+			}
+
+			// Remove old container if exists
+			rmCmd := exec.Command("docker", "rm", "-f", containerName)
+			rmCmd.Run() // Ignore error if container doesn't exist
+
+			// Create volume for models if not exists
+			volCreateCmd := exec.Command("docker", "volume", "create", "cs-translate-models")
+			volCreateCmd.Run() // Ignore error if volume exists
+
+			// Run the container in detached mode
+			runCmd := exec.Command("docker", "run", "-d",
+				"--name", containerName,
+				"-p", "11434:11434",
+				"-v", "cs-translate-models:/data",
+				"--privileged",
+				"cs-translate:latest")
+			runCmd.Stdout = os.Stdout
+			runCmd.Stderr = os.Stderr
+			if err := runCmd.Run(); err != nil {
+				return fmt.Errorf("failed to start docker container: %w", err)
+			}
+
+			time.Sleep(5 * time.Second)
+		}
+	}
+
+	// Wait for Ollama to be ready
+	ollamaURL := "http://localhost:11434"
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	fmt.Println("Waiting for Ollama to be ready...")
+	for i := 0; i < 30; i++ {
+		resp, err := client.Get(ollamaURL + "/api/version")
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	resp, err := client.Get(ollamaURL + "/api/version")
+	if err != nil {
+		return fmt.Errorf("Ollama Docker container not responding: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var versionResp OllamaVersionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&versionResp); err == nil {
+		fmt.Printf("✔ Ollama is running in Docker (version: %s)\n", versionResp.Version)
+	} else {
+		fmt.Println("✔ Ollama is running in Docker")
+	}
+
+	// Pull the model inside the container
+	model := translator.DefaultOllamaModel
+	fmt.Printf("Checking for Ollama model '%s'...\n", model)
+	if err := checkAndPullDockerModel(scanner, model); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// checkAndPullDockerModel checks and pulls model inside the Docker container
+func checkAndPullDockerModel(scanner *bufio.Scanner, model string) error {
+	ollamaURL := "http://localhost:11434"
+
+	// Check if model exists via API
+	modelURL := fmt.Sprintf("%s/api/tags", ollamaURL)
+	resp, err := http.Get(modelURL)
+	if err == nil {
+		defer resp.Body.Close()
+
+		var tagsResp struct {
+			Models []struct {
+				Name string `json:"name"`
+			} `json:"models"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&tagsResp); err == nil {
+			for _, m := range tagsResp.Models {
+				if strings.HasPrefix(m.Name, model) {
+					fmt.Printf("✔ Model '%s' is already installed\n", model)
+					return nil
+				}
+			}
+		}
+	}
+
+	fmt.Printf("Model '%s' not found.\n", model)
+	fmt.Printf("Do you want to download '%s'? (~2GB, required for translation) [Y/n]: ", model)
+	if scanner.Scan() {
+		input := strings.TrimSpace(scanner.Text())
+		if input == "" || strings.ToLower(input) == "y" || strings.ToLower(input) == "yes" {
+			fmt.Printf("Pulling model '%s' in Docker... (this may take a few minutes)\n", model)
+			pullCmd := exec.Command("docker", "exec", "cs-translate", "ollama", "pull", model)
+			pullCmd.Stdout = os.Stdout
+			pullCmd.Stderr = os.Stderr
+			if err := pullCmd.Run(); err != nil {
+				return fmt.Errorf("failed to pull model: %w", err)
+			}
+			fmt.Printf("✔ Model '%s' downloaded successfully\n", model)
+		} else {
+			return fmt.Errorf("model '%s' is required for translation", model)
+		}
 	}
 
 	return nil

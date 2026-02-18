@@ -61,7 +61,7 @@ func main() {
 	if !*useVoice {
 		// Check if user explicitly passed false? flag package defaults to false.
 		// Let's ask user.
-		fmt.Print("Enable Local Voice Transcription (requires python3 + openai-whisper)? [y/N]: ")
+		fmt.Print("Enable Voice Transcription (uses Docker by default)? [y/N]: ")
 		if scanner.Scan() {
 			input := strings.TrimSpace(scanner.Text())
 			if strings.ToLower(input) == "y" || strings.ToLower(input) == "yes" {
@@ -199,6 +199,7 @@ loop:
 		select {
 		case <-c:
 			fmt.Println("\nStopping...")
+			stopDockerContainer()
 			break loop
 
 		case line, ok := <-logLines:
@@ -515,4 +516,12 @@ func openSteamSettings() error {
 	}
 
 	return cmd.Start()
+}
+
+func stopDockerContainer() {
+	containerName := "cs-translate"
+	cmd := exec.Command("docker", "stop", containerName)
+	if err := cmd.Run(); err != nil {
+		log.Printf("Warning: failed to stop docker container: %v", err)
+	}
 }

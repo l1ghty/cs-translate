@@ -27,24 +27,33 @@ type Listener struct {
 	pythonStdout   *bufio.Scanner
 	stop           chan struct{}
 	transcriptions chan string
-	mu             sync.Mutex // Protects python process access if needed, though we use a loop
+	mu             sync.Mutex
 	fileQueue      chan string
+	useDocker      bool
+}
+
+func useDockerWhisper() bool {
+	return os.Getenv("USE_DOCKER_WHISPER") == "1"
 }
 
 func NewListener(scriptPath string) (*Listener, error) {
+	if useDockerWhisper() {
+		return newDockerListener()
+	}
+	return newLocalListener(scriptPath)
+}
+
+func newLocalListener(scriptPath string) (*Listener, error) {
 	tmpDir, err := os.MkdirTemp("", "cs-translate-audio")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
 
-	// Verify the script exists
 	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("transcriber script not found at %s", scriptPath)
 	}
 
-	// Prepare python command
 	cwd, _ := os.Getwd()
-	// Check for venv python first, then system python
 	var pythonPath string
 	if runtime.GOOS == "windows" {
 		pythonPath = filepath.Join(cwd, "venv", "Scripts", "python.exe")
@@ -60,8 +69,7 @@ func NewListener(scriptPath string) (*Listener, error) {
 		}
 	}
 
-	cmd := exec.Command(pythonPath, "-u", scriptPath) // -u for unbuffered binary stdout
-	// Actually python script uses flush=True so -u might not be strictly needed but good practice.
+	cmd := exec.Command(pythonPath, "-u", scriptPath)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -73,10 +81,7 @@ func NewListener(scriptPath string) (*Listener, error) {
 		return nil, fmt.Errorf("failed to get python stdout: %w", err)
 	}
 
-	// Redirect stderr to our stderr for debugging
 	cmd.Stderr = os.Stderr
-
-	// Set Whisper model via environment variable
 	cmd.Env = append(os.Environ(), fmt.Sprintf("WHISPER_MODEL=%s", getWhisperModel()))
 
 	if err := cmd.Start(); err != nil {
@@ -85,13 +90,10 @@ func NewListener(scriptPath string) (*Listener, error) {
 
 	scanner := bufio.NewScanner(stdout)
 
-	// Wait for "READY"
 	if scanner.Scan() {
 		text := scanner.Text()
 		if !strings.Contains(text, "READY") {
-			// Might be a warning or loading message if not filtered correctly
 			log.Printf("Transcriber initialization: %s", text)
-			// Loop until READY
 			for scanner.Scan() {
 				text = scanner.Text()
 				if strings.Contains(text, "READY") {
@@ -110,11 +112,102 @@ func NewListener(scriptPath string) (*Listener, error) {
 		stop:           make(chan struct{}),
 		transcriptions: make(chan string),
 		fileQueue:      make(chan string, 100),
+		useDocker:      false,
 	}
 
 	go l.worker()
 
 	return l, nil
+}
+
+func newDockerListener() (*Listener, error) {
+	log.Println("Using Docker-based Whisper transcription")
+
+	containerName := "cs-translate"
+
+	checkCmd := exec.Command("docker", "ps", "--filter", "name="+containerName, "--format", "{{.Names}}")
+	output, err := checkCmd.Output()
+	if err != nil || strings.TrimSpace(string(output)) != containerName {
+		return nil, fmt.Errorf("Docker container '%s' is not running. Please run cs-translate first to start the container", containerName)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "cs-translate-audio")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+
+	l := &Listener{
+		outputDir:      tmpDir,
+		stop:           make(chan struct{}),
+		transcriptions: make(chan string),
+		fileQueue:      make(chan string, 100),
+		useDocker:      true,
+	}
+
+	go l.dockerWorker()
+
+	return l, nil
+}
+
+func (l *Listener) dockerWorker() {
+	for path := range l.fileQueue {
+		time.Sleep(100 * time.Millisecond)
+
+		if l.isSilent(path) {
+			os.Remove(path)
+			continue
+		}
+
+		transcribeStart := time.Now()
+
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			log.Printf("Failed to get absolute path: %v", err)
+			continue
+		}
+
+		cmd := exec.Command("docker", "exec", "-i", "cs-translate", "python", "-u", "/app/transcriber.py")
+		cmd.Env = append(os.Environ(), fmt.Sprintf("WHISPER_MODEL=%s", getWhisperModel()))
+
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			log.Printf("Failed to get docker stdin: %v", err)
+			continue
+		}
+
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			log.Printf("Failed to get docker stdout: %v", err)
+			continue
+		}
+
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Start(); err != nil {
+			log.Printf("Failed to start docker process: %v", err)
+			continue
+		}
+
+		_, err = fmt.Fprintln(stdin, absPath)
+		stdin.Close()
+
+		if err != nil {
+			log.Printf("Failed to send path to docker: %v", err)
+			continue
+		}
+
+		scanner := bufio.NewScanner(stdout)
+		if scanner.Scan() {
+			text := strings.TrimSpace(scanner.Text())
+			transcribeDuration := time.Since(transcribeStart)
+			if text != "" {
+				l.transcriptions <- fmt.Sprintf("%s|%.2f", text, transcribeDuration.Seconds())
+			}
+		}
+
+		cmd.Wait()
+		os.Remove(path)
+	}
 }
 
 func (l *Listener) Start(ctx context.Context, device string) error {
