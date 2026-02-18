@@ -12,6 +12,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/micha/cs-ingame-translate/translator"
 )
 
 // EnsureEnvironment checks for required dependencies and offers to install them if possible
@@ -78,7 +80,7 @@ func setupOllama(scanner *bufio.Scanner) error {
 	}
 
 	// Check and pull the model
-	model := "qwen3:0.6b"
+	model := translator.DefaultOllamaModel
 	fmt.Printf("Checking for Ollama model '%s'...\n", model)
 	if err := checkAndPullModel(scanner, model); err != nil {
 		return err

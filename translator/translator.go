@@ -52,7 +52,7 @@ func NewOllamaTranslator(ctx context.Context, model, targetLang string) (*Ollama
 	}
 
 	if model == "" {
-		model = "qwen3:0.6b" // Default lightweight model for translation
+		model = DefaultOllamaModel
 	}
 
 	if targetLang == "" {
