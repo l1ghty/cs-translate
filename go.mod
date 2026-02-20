@@ -6,6 +6,7 @@ toolchain go1.24.12
 
 require (
 	github.com/fsnotify/fsnotify v1.6.0
+	github.com/moutend/go-hook v0.1.0
 	github.com/nxadm/tail v1.4.11
 )
 

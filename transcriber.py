@@ -53,6 +53,11 @@ def main():
             print("", flush=True) # Send empty line to signal done/error
 
 if __name__ == "__main__":
+    # Force UTF-8 for Windows console
+    if sys.platform == "win32":
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8')
+
     try:
         main()
     except KeyboardInterrupt:

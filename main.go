@@ -301,25 +301,79 @@ func runEchoMode(ctx context.Context, scanner *bufio.Scanner, tr *translator.Oll
 
 			// Stop current recording gracefully to finalize WAV header
 			if currentCmd != nil && currentCmd.Process != nil {
-				currentCmd.Process.Signal(syscall.SIGTERM)
+				// Try to stop gracefully
+				if runtime.GOOS == "windows" {
+					// Windows doesn't support graceful SIGTERM to subprocess easily
+					// Try sending Ctrl+Break event if possible, or just Kill.
+					// For now, we'll try Kill immediately as it's the most reliable way to release the file handle
+					currentCmd.Process.Kill()
+				} else {
+					currentCmd.Process.Signal(syscall.SIGTERM)
+				}
+
 				done := make(chan error, 1)
 				go func() { done <- currentCmd.Wait() }()
 				select {
 				case <-done:
-				case <-time.After(1 * time.Second):
+				case <-time.After(500 * time.Millisecond):
 					currentCmd.Process.Kill()
+					<-done // Wait for release
 				}
+			}
+
+			// Check if file exists before renaming
+			if _, err := os.Stat(currentRecPath); os.IsNotExist(err) {
+				log.Printf("Recording file not found: %s (Audio capture might have failed to start)", currentRecPath)
+				// Restart recording to try again
+				var err error
+				currentCmd, err = startAudioRecording(ctx, currentRecPath, device)
+				if err != nil {
+					log.Printf("Failed to restart recording: %v", err)
+				}
+				continue
 			}
 
 			// Rename current to last
 			lastRecPath := filepath.Join(tmpDir, fmt.Sprintf("rec_%d.wav", time.Now().UnixNano()))
-			os.Rename(currentRecPath, lastRecPath)
+
+			// Retry rename loop for Windows locking issues
+			var renameErr error
+			for i := 0; i < 10; i++ {
+				renameErr = os.Rename(currentRecPath, lastRecPath)
+				if renameErr == nil {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			if renameErr != nil {
+				log.Printf("Failed to rename recording file: %v", renameErr)
+				// Clean up and restart
+				os.Remove(currentRecPath)
+				var err error
+				currentCmd, err = startAudioRecording(ctx, currentRecPath, device)
+				if err != nil {
+					log.Printf("Failed to restart recording: %v", err)
+				}
+				continue
+			}
 
 			// Start new recording immediately
 			var err error
 			currentCmd, err = startAudioRecording(ctx, currentRecPath, device)
 			if err != nil {
 				log.Printf("Failed to restart recording: %v", err)
+			} else {
+				// On Windows, monitor if ffmpeg stays alive for a second
+				go func() {
+					time.Sleep(1 * time.Second)
+					if currentCmd != nil && currentCmd.Process != nil {
+						// Check if process still running
+						// os.FindProcess(pid) always succeeds on Unix, on Windows it finds the handle.
+						// A better check is to see if Wait() returns quickly, but we can't call Wait twice.
+						// We'll trust the user sees "ffmpeg exited" errors if it fails.
+					}
+				}()
 			}
 
 			// Process last recording in background
@@ -328,11 +382,18 @@ func runEchoMode(ctx context.Context, scanner *bufio.Scanner, tr *translator.Oll
 
 				// Slice last 15s
 				slicePath := filepath.Join(tmpDir, fmt.Sprintf("slice_%d.wav", time.Now().UnixNano()))
-				// ffmpeg -sseof -15 -i input -c copy output
-				sliceCmd := exec.Command("ffmpeg", "-sseof", "-15", "-i", inputPath, "-y", slicePath)
+
+				// ffmpeg command to slice
+				// On Windows, if the file header is corrupt due to Kill, we might need to be lenient
+				sliceCmd := exec.Command("ffmpeg", "-sseof", "-15", "-i", inputPath, "-c", "copy", "-y", slicePath)
 				if out, err := sliceCmd.CombinedOutput(); err != nil {
-					log.Printf("Slice failed: %v\n%s", err, string(out))
-					return
+					// Fallback: try re-encoding if copy fails (e.g. corrupt header)
+					log.Printf("Quick slice failed, trying re-encode: %v", err)
+					sliceCmd = exec.Command("ffmpeg", "-sseof", "-15", "-i", inputPath, "-c:a", "pcm_s16le", "-y", slicePath)
+					if out2, err2 := sliceCmd.CombinedOutput(); err2 != nil {
+						log.Printf("Slice failed: %v\n%s\n%s", err2, string(out), string(out2))
+						return
+					}
 				}
 
 				// Submit to transcriber

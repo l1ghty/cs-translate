@@ -55,6 +55,11 @@ func checkDocker() error {
 }
 
 func checkAndInstallNvidiaContainerToolkit(scanner *bufio.Scanner) error {
+	// On Windows and macOS, GPU support is handled by Docker Desktop
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+
 	fmt.Println("Checking for nvidia-container-toolkit...")
 
 	checkCmd := exec.Command("nvidia-container-runtime", "--version")
@@ -228,7 +233,33 @@ func setupOllama(scanner *bufio.Scanner) error {
 	fmt.Println("Checking Ollama installation...")
 
 	// Default to Docker if USE_DOCKER_OLLAMA is not explicitly set to "0"
-	if os.Getenv("USE_DOCKER_OLLAMA") != "0" {
+	useDocker := os.Getenv("USE_DOCKER_OLLAMA") != "0"
+
+	// On Windows, if environment variable is not set, provide choice or fallback
+	if os.Getenv("USE_DOCKER_OLLAMA") == "" && runtime.GOOS == "windows" {
+		if err := checkDocker(); err != nil {
+			fmt.Println("Docker not detected. Defaulting to native installation.")
+			useDocker = false
+		} else {
+			fmt.Println("Select installation method:")
+			fmt.Println("1. Docker (Recommended - Unified container)")
+			fmt.Println("2. Native (Run Ollama and Python directly on Windows)")
+			fmt.Print("Enter choice [1]: ")
+			if scanner.Scan() {
+				input := strings.TrimSpace(scanner.Text())
+				if input == "2" {
+					useDocker = false
+				}
+			}
+		}
+
+		if !useDocker {
+			os.Setenv("USE_DOCKER_OLLAMA", "0")
+			os.Setenv("USE_DOCKER_WHISPER", "0")
+		}
+	}
+
+	if useDocker {
 		return setupDockerContainer(scanner)
 	}
 
