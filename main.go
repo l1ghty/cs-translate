@@ -22,6 +22,7 @@ import (
 	"github.com/micha/cs-ingame-translate/parser"
 	"github.com/micha/cs-ingame-translate/setup"
 	"github.com/micha/cs-ingame-translate/translator"
+	"github.com/nxadm/tail"
 )
 
 //go:embed transcriber.py
@@ -57,7 +58,8 @@ func main() {
 	// Mode Selection
 	fmt.Println("Select Mode:")
 	fmt.Println("1. CS2 In-Game Translate (Monitor Console Log)")
-	fmt.Println("2. Voice Command/Echo Mode (Record Output + F9 Trigger)")
+	fmt.Println("2. Additionally listening to system output audio " +
+		"\nPress F9 to capture the last 15 seconds, transcribe, and translate.")
 	fmt.Print("Enter choice [1]: ")
 
 	mode := "1"
@@ -146,7 +148,7 @@ func main() {
 		if audioListener == nil {
 			log.Fatal("Echo mode requires working audio transcription. Please ensure dependencies are met.")
 		}
-		runEchoMode(ctx, tr, audioListener, *audioDevice, preRecCmd, preRecDir, preRecPath)
+		runEchoMode(ctx, scanner, tr, audioListener, *logPath, *audioDevice, preRecCmd, preRecDir, preRecPath)
 	} else {
 		// Clean up pre-recording if it happened (shouldn't happen here but safe)
 		if preRecCmd != nil && preRecCmd.Process != nil {
@@ -189,11 +191,40 @@ func startAudioRecording(ctx context.Context, path, device string) (*exec.Cmd, e
 	return cmd, nil
 }
 
-func runEchoMode(ctx context.Context, tr *translator.OllamaTranslator, listener *audio.Listener, device string, initialCmd *exec.Cmd, tmpDir string, initialPath string) {
+func runEchoMode(ctx context.Context, scanner *bufio.Scanner, tr *translator.OllamaTranslator, listener *audio.Listener, logPath string, device string, initialCmd *exec.Cmd, tmpDir string, initialPath string) {
 	fmt.Println("\n=== Echo Mode Started ===")
-	fmt.Println("Listening to system output audio...")
+	fmt.Println("Listening to system output audio + Monitoring CS2 Console...")
 	fmt.Println("Press F9 to capture the last 15 seconds, transcribe, and translate.")
 	fmt.Println("Press Ctrl+C to exit.")
+
+	// --- Console Monitor Setup ---
+	// Find log file
+	path := logPath
+	if path == "" {
+		fmt.Println("Auto-detecting log file location...")
+		path, _ = findLogFile() // Ignore error, just try once silently or use empty
+		if path != "" {
+			fmt.Printf("Found log file: %s\n", path)
+		} else {
+			fmt.Println("Warning: Could not auto-detect log file. Console translation disabled until restart with -log flag.")
+		}
+	}
+
+	var mon *monitor.Monitor
+	var logLines chan *tail.Line
+	if path != "" {
+		fmt.Printf("Monitoring log file: %s\n", path)
+		var err error
+		mon, err = monitor.NewMonitor(path)
+		if err != nil {
+			log.Printf("Error creating monitor: %v", err)
+		} else {
+			// defer mon.Stop() // Cannot defer in loop/long running function easily if not careful, but okay here as we return on exit
+			// Actually we should handle stop manually on exit
+			logLines = mon.Lines()
+		}
+	}
+	// -----------------------------
 
 	if tmpDir == "" {
 		// Fallback if pre-recording failed or didn't run
@@ -246,6 +277,25 @@ func runEchoMode(ctx context.Context, tr *translator.OllamaTranslator, listener 
 		case err := <-hkErr:
 			log.Printf("Hotkey error: %v", err)
 			return
+
+		// Console Monitor Case
+		case line, ok := <-logLines:
+			if !ok {
+				logLines = nil // Stop listening if closed
+				continue
+			}
+			if line.Err != nil {
+				continue
+			}
+			msg := parser.ParseLine(line.Text)
+			if msg != nil {
+				translated, err := tr.Translate(ctx, msg.MessageContent)
+				if err != nil {
+					translated = "[Translation Pending/Error]"
+				}
+				outputChat(msg.PlayerName, translated, msg.IsDead, msg.OriginalText)
+			}
+
 		case <-hk.KeyPressed():
 			fmt.Println("\n[F9] Capturing...")
 
