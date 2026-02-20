@@ -136,78 +136,108 @@ func newDockerListener() (*Listener, error) {
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
 
+	// Use persistent docker exec command
+	cmd := exec.Command("docker", "exec", "-i", "cs-translate", "python3", "-u", "/app/transcriber.py")
+	cmd.Env = append(os.Environ(), fmt.Sprintf("WHISPER_MODEL=%s", getWhisperModel()))
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get docker stdin: %w", err)
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get docker stdout: %w", err)
+	}
+
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start docker process: %w", err)
+	}
+
+	// Wait for READY signal from transcriber
+	scanner := bufio.NewScanner(stdout)
+	if scanner.Scan() {
+		text := scanner.Text()
+		if !strings.Contains(text, "READY") {
+			log.Printf("Docker Transcriber initialization: %s", text)
+			for scanner.Scan() {
+				text = scanner.Text()
+				if strings.Contains(text, "READY") {
+					break
+				}
+				log.Printf("Docker Transcriber init: %s", text)
+			}
+		}
+	}
+
 	l := &Listener{
 		outputDir:      tmpDir,
+		pythonCmd:      cmd,
+		pythonStdin:    stdin,
+		pythonStdout:   scanner,
 		stop:           make(chan struct{}),
 		transcriptions: make(chan string),
 		fileQueue:      make(chan string, 100),
 		useDocker:      true,
 	}
 
-	go l.dockerWorker()
+	go l.dockerPersistentWorker()
 
 	return l, nil
 }
 
-func (l *Listener) dockerWorker() {
+func (l *Listener) dockerPersistentWorker() {
 	for path := range l.fileQueue {
-		time.Sleep(100 * time.Millisecond)
+		// Start timing for transcription
+		transcribeStart := time.Now()
 
-		if l.isSilent(path) {
+		// 1. Copy file to container
+		fileName := filepath.Base(path)
+		containerPath := "/tmp/" + fileName
+		// We use `docker cp` to copy the file into the container
+		cpCmd := exec.Command("docker", "cp", path, "cs-translate:"+containerPath)
+		if err := cpCmd.Run(); err != nil {
+			log.Printf("Failed to copy file to container: %v", err)
 			os.Remove(path)
 			continue
 		}
 
-		transcribeStart := time.Now()
-
-		absPath, err := filepath.Abs(path)
-		if err != nil {
-			log.Printf("Failed to get absolute path: %v", err)
-			continue
-		}
-
-		cmd := exec.Command("docker", "exec", "-i", "cs-translate", "python", "-u", "/app/transcriber.py")
-		cmd.Env = append(os.Environ(), fmt.Sprintf("WHISPER_MODEL=%s", getWhisperModel()))
-
-		stdin, err := cmd.StdinPipe()
-		if err != nil {
-			log.Printf("Failed to get docker stdin: %v", err)
-			continue
-		}
-
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			log.Printf("Failed to get docker stdout: %v", err)
-			continue
-		}
-
-		cmd.Stderr = os.Stderr
-
-		if err := cmd.Start(); err != nil {
-			log.Printf("Failed to start docker process: %v", err)
-			continue
-		}
-
-		_, err = fmt.Fprintln(stdin, absPath)
-		stdin.Close()
+		// 2. Send container path to python
+		l.mu.Lock()
+		_, err := fmt.Fprintln(l.pythonStdin, containerPath)
+		l.mu.Unlock()
 
 		if err != nil {
-			log.Printf("Failed to send path to docker: %v", err)
+			log.Printf("Failed to send path to docker transcriber: %v", err)
 			continue
 		}
 
-		scanner := bufio.NewScanner(stdout)
-		if scanner.Scan() {
-			text := strings.TrimSpace(scanner.Text())
+		// 3. Read result
+		if l.pythonStdout.Scan() {
+			text := strings.TrimSpace(l.pythonStdout.Text())
 			transcribeDuration := time.Since(transcribeStart)
 			if text != "" {
 				l.transcriptions <- fmt.Sprintf("%s|%.2f", text, transcribeDuration.Seconds())
 			}
+		} else {
+			if err := l.pythonStdout.Err(); err != nil {
+				log.Printf("Error reading from docker transcriber: %v", err)
+			}
+			return
 		}
 
-		cmd.Wait()
+		// 4. Cleanup host file
 		os.Remove(path)
+
+		// 5. Cleanup container file (async)
+		go exec.Command("docker", "exec", "cs-translate", "rm", containerPath).Run()
 	}
+}
+
+func (l *Listener) dockerWorker() {
+	// Deprecated in favor of dockerPersistentWorker, keeping for reference if needed but not used
 }
 
 func (l *Listener) Start(ctx context.Context, device string) error {
@@ -237,7 +267,7 @@ func (l *Listener) Start(ctx context.Context, device string) error {
 		// Linux / PulseAudio
 		source := device
 		if source == "" || source == "default" {
-			source = getDefaultMonitorSource()
+			source = GetDefaultMonitorSource()
 		}
 
 		log.Printf("Starting audio listener on source: %s", source)
@@ -352,6 +382,10 @@ func (l *Listener) worker() {
 	}
 }
 
+func (l *Listener) SubmitFile(path string) {
+	l.fileQueue <- path
+}
+
 func (l *Listener) Transcriptions() <-chan string {
 	return l.transcriptions
 }
@@ -371,7 +405,7 @@ func (l *Listener) Stop() {
 	os.RemoveAll(l.outputDir)
 }
 
-func getDefaultMonitorSource() string {
+func GetDefaultMonitorSource() string {
 	out, err := exec.Command("pactl", "get-default-sink").Output()
 	if err == nil {
 		sink := strings.TrimSpace(string(out))

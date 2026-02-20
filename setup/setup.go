@@ -35,6 +35,7 @@ func EnsureEnvironment(scanner *bufio.Scanner, useVoice bool) error {
 		// Default to Docker if USE_DOCKER_WHISPER is not explicitly set to "0"
 		if os.Getenv("USE_DOCKER_WHISPER") != "0" {
 			fmt.Println("Using Docker for Whisper transcription (already running in unified container)")
+			os.Setenv("USE_DOCKER_WHISPER", "1")
 		} else {
 			if err := setupPythonEnv(scanner); err != nil {
 				return fmt.Errorf("failed to setup python environment: %w", err)
