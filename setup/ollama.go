@@ -108,7 +108,8 @@ func InstallOllama(scanner *bufio.Scanner) error {
 		defer os.Remove(installerPath)
 
 		fmt.Println("Running Ollama installer...")
-		cmd := exec.Command(installerPath)
+		// Use start command to ensure the installer window gets focus
+		cmd := exec.Command("cmd", "/c", "start", "/wait", "Ollama Setup", installerPath)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
