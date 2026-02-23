@@ -248,107 +248,26 @@ func runEchoMode(ctx context.Context, scanner *bufio.Scanner, tr *translator.Oll
 		case <-hk.KeyPressed():
 			fmt.Println("\n[F9] Capturing...")
 
-			// Stop current recording gracefully to finalize WAV header
-			if currentCmd != nil && currentCmd.Process != nil {
-				// Try to stop gracefully
-				if runtime.GOOS == "windows" {
-					// Windows doesn't support graceful SIGTERM to subprocess easily
-					// Try sending Ctrl+Break event if possible, or just Kill.
-					// For now, we'll try Kill immediately as it's the most reliable way to release the file handle
-					currentCmd.Process.Kill()
-				} else {
-					currentCmd.Process.Signal(syscall.SIGTERM)
-				}
+			stopRecordingGracefully(currentCmd)
 
-				done := make(chan error, 1)
-				go func() { done <- currentCmd.Wait() }()
-				select {
-				case <-done:
-				case <-time.After(500 * time.Millisecond):
-					currentCmd.Process.Kill()
-					<-done // Wait for release
-				}
-			}
-
-			// Check if file exists before renaming
 			if _, err := os.Stat(currentRecPath); os.IsNotExist(err) {
 				log.Printf("Recording file not found: %s (Audio capture might have failed to start)", currentRecPath)
-				// Restart recording to try again
-				var err error
-				currentCmd, err = startAudioRecording(ctx, currentRecPath, device)
-				if err != nil {
-					log.Printf("Failed to restart recording: %v", err)
-				}
+				currentCmd, _ = startAudioRecording(ctx, currentRecPath, device)
 				continue
 			}
 
-			// Rename current to last
 			lastRecPath := filepath.Join(tmpDir, fmt.Sprintf("rec_%d.wav", time.Now().UnixNano()))
 
-			// Retry rename loop for Windows locking issues
-			var renameErr error
-			for i := 0; i < 10; i++ {
-				renameErr = os.Rename(currentRecPath, lastRecPath)
-				if renameErr == nil {
-					break
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-
-			if renameErr != nil {
-				log.Printf("Failed to rename recording file: %v", renameErr)
-				// Clean up and restart
+			if err := renameWithRetry(currentRecPath, lastRecPath); err != nil {
+				log.Printf("Failed to rename recording file: %v", err)
 				os.Remove(currentRecPath)
-				var err error
-				currentCmd, err = startAudioRecording(ctx, currentRecPath, device)
-				if err != nil {
-					log.Printf("Failed to restart recording: %v", err)
-				}
+				currentCmd, _ = startAudioRecording(ctx, currentRecPath, device)
 				continue
 			}
 
-			// Start new recording immediately
-			var err error
-			currentCmd, err = startAudioRecording(ctx, currentRecPath, device)
-			if err != nil {
-				log.Printf("Failed to restart recording: %v", err)
-			} else {
-				// On Windows, monitor if ffmpeg stays alive for a second
-				go func() {
-					time.Sleep(1 * time.Second)
-					if currentCmd != nil && currentCmd.Process != nil {
-						// Check if process still running
-						// os.FindProcess(pid) always succeeds on Unix, on Windows it finds the handle.
-						// A better check is to see if Wait() returns quickly, but we can't call Wait twice.
-						// We'll trust the user sees "ffmpeg exited" errors if it fails.
-					}
-				}()
-			}
+			currentCmd, _ = startAudioRecording(ctx, currentRecPath, device)
 
-			// Process last recording in background
-			go func(inputPath string) {
-				defer os.Remove(inputPath)
-
-				// Slice last 15s
-				slicePath := filepath.Join(tmpDir, fmt.Sprintf("slice_%d.wav", time.Now().UnixNano()))
-
-				// ffmpeg command to slice
-				// On Windows, if the file header is corrupt due to Kill, we might need to be lenient
-				sliceCmd := exec.Command("ffmpeg", "-sseof", "-15", "-i", inputPath, "-c", "copy", "-y", slicePath)
-				if out, err := sliceCmd.CombinedOutput(); err != nil {
-					// Fallback: try re-encoding if copy fails (e.g. corrupt header)
-					log.Printf("Quick slice failed, trying re-encode: %v", err)
-					sliceCmd = exec.Command("ffmpeg", "-sseof", "-15", "-i", inputPath, "-c:a", "pcm_s16le", "-y", slicePath)
-					if out2, err2 := sliceCmd.CombinedOutput(); err2 != nil {
-						log.Printf("Slice failed: %v\n%s\n%s", err2, string(out), string(out2))
-						return
-					}
-				}
-
-				// Submit to transcriber
-				absPath, _ := filepath.Abs(slicePath)
-				listener.SubmitFile(absPath)
-			}(lastRecPath)
+			sliceAudioFile(lastRecPath, tmpDir, listener)
 
 		case text := <-transcriptions:
 			parts := strings.Split(text, "|")
@@ -422,12 +341,8 @@ func runCS2Mode(ctx context.Context, scanner *bufio.Scanner, tr *translator.Olla
 		audioChan = audioListener.Transcriptions()
 	}
 
-	// Voice context buffer logic (simplified from original main)
-	type voiceTranscription struct {
-		text      string
-		timestamp time.Time
-	}
-	var voiceContext []voiceTranscription
+	// Voice context buffer logic
+	var voiceContext []voiceContextItem
 
 	fmt.Println("Waiting for chat messages...")
 
@@ -461,58 +376,9 @@ loop:
 				continue
 			}
 
-			// Parse transcription
-			transcribeDuration := 0.0
-			transcribedText := text
-			if idx := strings.LastIndex(text, "|"); idx != -1 {
-				if n, err := fmt.Sscanf(text[idx+1:], "%f", &transcribeDuration); err == nil && n == 1 {
-					transcribedText = text[:idx]
-				}
-			}
-
-			// Add to context
-			now := time.Now()
-			voiceContext = append(voiceContext, voiceTranscription{text: transcribedText, timestamp: now})
-
-			// Prune old context
-			cutoff := now.Add(-10 * time.Second)
-			validIdx := 0
-			for i, v := range voiceContext {
-				if v.timestamp.After(cutoff) {
-					validIdx = i
-					break
-				}
-			}
-			if validIdx > 0 {
-				voiceContext = voiceContext[validIdx:]
-			}
-
-			// Build context string
-			var contextText strings.Builder
-			for _, v := range voiceContext[:len(voiceContext)-1] {
-				if contextText.Len() > 0 {
-					contextText.WriteString("\n")
-				}
-				contextText.WriteString(v.text)
-			}
-
-			// Translate
-			translateStart := time.Now()
-			var translated string
-			var err error
-			if contextText.Len() > 0 {
-				translated, err = tr.TranslateWithContext(ctx, transcribedText, translator.VoiceContext{ContextText: contextText.String()})
-			} else {
-				translated, err = tr.Translate(ctx, transcribedText)
-			}
-			translateDuration := time.Since(translateStart)
-
-			if err != nil {
-				translated = transcribedText
-			}
-
-			fmt.Printf("Voice %.2fs: %s \n", transcribeDuration, transcribedText)
-			outputChat(fmt.Sprintf("voice %.2fs: ", translateDuration.Seconds()), translated, false, "")
+			translated, prefix, transcribeDuration := handleVoiceTranscription(ctx, tr, text, voiceContext)
+			fmt.Printf("Voice %.2fs: %s \n", transcribeDuration, text)
+			outputChat(prefix, translated, false, "")
 		}
 	}
 }

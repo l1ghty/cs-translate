@@ -2,12 +2,19 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"syscall"
+	"time"
 
 	"github.com/micha/cs-ingame-translate/audio"
-	"strings"
+	"github.com/micha/cs-ingame-translate/translator"
 )
 
 func listAudioDevices() {
@@ -77,4 +84,123 @@ func initAudioListener(useVoice bool) *audio.Listener {
 		return nil
 	}
 	return audioListener
+}
+
+type voiceContextItem struct {
+	text      string
+	timestamp time.Time
+}
+
+func parseTranscription(text string) (string, float64) {
+	transcribeDuration := 0.0
+	transcribedText := text
+	if idx := strings.LastIndex(text, "|"); idx != -1 {
+		if n, err := fmt.Sscanf(text[idx+1:], "%f", &transcribeDuration); err == nil && n == 1 {
+			transcribedText = text[:idx]
+		}
+	}
+	return transcribedText, transcribeDuration
+}
+
+func pruneOldContext(context []voiceContextItem, cutoff time.Time) []voiceContextItem {
+	for i, v := range context {
+		if v.timestamp.After(cutoff) {
+			return context[i:]
+		}
+	}
+	return context
+}
+
+func buildContextString(context []voiceContextItem) string {
+	if len(context) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for i, v := range context[:len(context)-1] {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(v.text)
+	}
+	return sb.String()
+}
+
+func handleVoiceTranscription(ctx context.Context, tr *translator.OllamaTranslator, text string, voiceContext []voiceContextItem) (string, string, float64) {
+	transcribedText, transcribeDuration := parseTranscription(text)
+
+	now := time.Now()
+	voiceContext = append(voiceContext, voiceContextItem{text: transcribedText, timestamp: now})
+
+	cutoff := now.Add(-10 * time.Second)
+	voiceContext = pruneOldContext(voiceContext, cutoff)
+
+	contextText := buildContextString(voiceContext)
+
+	translateStart := time.Now()
+	var translated string
+	var err error
+	if len(contextText) > 0 {
+		translated, err = tr.TranslateWithContext(ctx, transcribedText, translator.VoiceContext{ContextText: contextText})
+	} else {
+		translated, err = tr.Translate(ctx, transcribedText)
+	}
+	translateDuration := time.Since(translateStart)
+
+	if err != nil {
+		translated = transcribedText
+	}
+
+	return translated, fmt.Sprintf("voice %.2fs: ", translateDuration.Seconds()), transcribeDuration
+}
+
+func sliceAudioFile(inputPath, tmpDir string, listener *audio.Listener) {
+	go func() {
+		defer os.Remove(inputPath)
+
+		slicePath := filepath.Join(tmpDir, fmt.Sprintf("slice_%d.wav", time.Now().UnixNano()))
+
+		sliceCmd := exec.Command("ffmpeg", "-sseof", "-15", "-i", inputPath, "-c", "copy", "-y", slicePath)
+		if out, err := sliceCmd.CombinedOutput(); err != nil {
+			log.Printf("Quick slice failed, trying re-encode: %v", err)
+			sliceCmd = exec.Command("ffmpeg", "-sseof", "-15", "-i", inputPath, "-c:a", "pcm_s16le", "-y", slicePath)
+			if out2, err2 := sliceCmd.CombinedOutput(); err2 != nil {
+				log.Printf("Slice failed: %v\n%s\n%s", err2, string(out), string(out2))
+				return
+			}
+		}
+
+		absPath, _ := filepath.Abs(slicePath)
+		listener.SubmitFile(absPath)
+	}()
+}
+
+func stopRecordingGracefully(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+
+	if runtime.GOOS == "windows" {
+		cmd.Process.Kill()
+	} else {
+		cmd.Process.Signal(syscall.SIGTERM)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		cmd.Process.Kill()
+		<-done
+	}
+}
+
+func renameWithRetry(from, to string) error {
+	for i := 0; i < 10; i++ {
+		if err := os.Rename(from, to); err == nil {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return os.Rename(from, to)
 }
