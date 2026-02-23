@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 )
@@ -51,10 +50,7 @@ type VoiceContext struct {
 
 // NewOllamaTranslator creates a new Ollama translator
 func NewOllamaTranslator(ctx context.Context, model, targetLang string) (*OllamaTranslator, error) {
-	baseURL := os.Getenv("OLLAMA_HOST")
-	if baseURL == "" {
-		baseURL = "http://localhost:11434"
-	}
+	baseURL := OllamaHost
 
 	if model == "" {
 		model = DefaultOllamaModel

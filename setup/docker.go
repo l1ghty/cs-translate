@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -107,10 +108,27 @@ func buildAndRunContainer(name string) error {
 	volCreateCmd := exec.Command("docker", "volume", "create", "cs-translate-models")
 	volCreateCmd.Run()
 
+	port := translator.DefaultOllamaPort
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		fmt.Printf("Port %d is already in use. Looking for an available port...\n", port)
+		ln.Close()
+		port, err = translator.FindAvailablePort(port + 1)
+		if err != nil {
+			return fmt.Errorf("could not find an available port: %w", err)
+		}
+		fmt.Printf("Using alternative port: %d\n", port)
+		fmt.Println("Note: You'll need to set OLLAMA_HOST to use this port.")
+		fmt.Printf("Run: export OLLAMA_HOST=http://localhost:%d\n", port)
+	} else {
+		ln.Close()
+	}
+
+	portStr := fmt.Sprintf("%d:%d", port, translator.DefaultOllamaPort)
 	runCmd := exec.Command("docker", "run", "-d",
 		"--gpus", "all",
 		"--name", name,
-		"-p", "11434:11434",
+		"-p", portStr,
 		"-v", "cs-translate-models:/data",
 		"--privileged",
 		"cs-translate:latest")
@@ -126,7 +144,7 @@ func buildAndRunContainer(name string) error {
 
 func waitForOllama() error {
 	client := &http.Client{Timeout: 10 * time.Second}
-	ollamaURL := "http://localhost:11434"
+	ollamaURL := translator.OllamaHost
 
 	fmt.Println("Waiting for Ollama to be ready...")
 	for i := 0; i < 30; i++ {
@@ -154,7 +172,7 @@ func waitForOllama() error {
 }
 
 func CheckAndPullDockerModel(scanner *bufio.Scanner, model string) error {
-	ollamaURL := "http://localhost:11434"
+	ollamaURL := translator.OllamaHost
 
 	modelURL := fmt.Sprintf("%s/api/tags", ollamaURL)
 	resp, err := http.Get(modelURL)
@@ -198,10 +216,7 @@ func CheckAndPullDockerModel(scanner *bufio.Scanner, model string) error {
 }
 
 func CheckAndPullModel(scanner *bufio.Scanner, model string) error {
-	ollamaURL := "http://localhost:11434"
-	if envURL := os.Getenv("OLLAMA_HOST"); envURL != "" {
-		ollamaURL = envURL
-	}
+	ollamaURL := translator.OllamaHost
 
 	checkCmd := exec.Command("ollama", "list")
 	output, err := checkCmd.CombinedOutput()

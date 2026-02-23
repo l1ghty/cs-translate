@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -52,10 +53,7 @@ func SetupOllama(scanner *bufio.Scanner) error {
 		return SetupDockerContainer(scanner)
 	}
 
-	ollamaURL := "http://localhost:11434"
-	if envURL := os.Getenv("OLLAMA_HOST"); envURL != "" {
-		ollamaURL = envURL
-	}
+	ollamaURL := translator.OllamaHost
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(ollamaURL + "/api/version")
@@ -137,7 +135,27 @@ func InstallOllama(scanner *bufio.Scanner) error {
 
 	fmt.Println("✔ Ollama installed successfully")
 	fmt.Println("Starting Ollama service...")
+
+	port := translator.DefaultOllamaPort
+	ln, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", port))
+	if err != nil {
+		fmt.Printf("Port %d is already in use. Looking for an available port...\n", port)
+		ln.Close()
+		port, err = translator.FindAvailablePort(port + 1)
+		if err != nil {
+			return fmt.Errorf("could not find an available port: %w", err)
+		}
+		fmt.Printf("Using alternative port: %d\n", port)
+		fmt.Println("Note: You'll need to set OLLAMA_HOST to use this port.")
+		fmt.Printf("Run: export OLLAMA_HOST=http://localhost:%d\n", port)
+	} else {
+		ln.Close()
+	}
+
+	env := os.Environ()
+	env = append(env, fmt.Sprintf("OLLAMA_HOST=localhost:%d", port))
 	ollamaCmd := exec.Command("ollama", "serve")
+	ollamaCmd.Env = env
 	ollamaCmd.Stdout = os.Stdout
 	ollamaCmd.Stderr = os.Stderr
 	if err := ollamaCmd.Start(); err != nil {
