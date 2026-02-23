@@ -20,7 +20,6 @@ import (
 	"github.com/micha/cs-ingame-translate/hotkey"
 	"github.com/micha/cs-ingame-translate/monitor"
 	"github.com/micha/cs-ingame-translate/parser"
-	"github.com/micha/cs-ingame-translate/setup"
 	"github.com/micha/cs-ingame-translate/translator"
 	"github.com/nxadm/tail"
 )
@@ -40,36 +39,12 @@ func main() {
 
 	// List audio devices if requested
 	if *listDevices {
-		fmt.Println(audio.GetDeviceHelpText())
-		devices, err := audio.GetAvailableDevices()
-		if err != nil {
-			fmt.Printf("Error listing devices: %v\n", err)
-		} else {
-			fmt.Println("Available audio devices:")
-			for i, device := range devices {
-				fmt.Printf("  %d. %s\n", i+1, device)
-			}
-		}
-		os.Exit(0)
+		listAudioDevices()
 	}
 
 	scanner := bufio.NewScanner(os.Stdin)
 
-	// Mode Selection
-	fmt.Println("Select Mode:")
-	fmt.Println("1. CS2 In-Game Translate (Monitor Console Log)")
-	fmt.Println("2. Additionally listening to system output audio " +
-		"\nPress F9 to capture the last 15 seconds, transcribe, and translate.")
-	fmt.Print("Enter choice [1]: ")
-
-	mode := "1"
-	if scanner.Scan() {
-		input := strings.TrimSpace(scanner.Text())
-		if input == "2" {
-			mode = "2"
-		}
-	}
-
+	mode := selectMode(scanner)
 	isEchoMode := mode == "2"
 
 	var preRecCmd *exec.Cmd
@@ -96,17 +71,11 @@ func main() {
 			fmt.Println("Background recording started.")
 		}
 	} else if !*useVoice {
-		fmt.Print("Enable Voice Transcription (uses Docker by default)? [y/N]: ")
-		if scanner.Scan() {
-			input := strings.TrimSpace(scanner.Text())
-			if strings.ToLower(input) == "y" || strings.ToLower(input) == "yes" {
-				*useVoice = true
-			}
-		}
+		*useVoice = promptVoiceEnable(scanner)
 	}
 
 	// --- Environment Check & Setup ---
-	if err := setup.EnsureEnvironment(scanner, *useVoice); err != nil {
+	if err := ensureEnvironment(scanner, *useVoice); err != nil {
 		log.Fatalf("Setup failed: %v", err)
 	}
 
@@ -119,29 +88,9 @@ func main() {
 
 	fmt.Printf("Using Ollama model '%s' for translation to %s\n", *ollamaModel, *targetLang)
 
-	// Initialize Audio Listener if enabled
-	var audioListener *audio.Listener
-	if *useVoice {
-		tmpFile, err := os.CreateTemp("", "transcriber-*.py")
-		if err != nil {
-			log.Fatalf("Failed to create temp file for transcriber: %v", err)
-		}
-		defer os.Remove(tmpFile.Name())
-
-		if _, err := tmpFile.Write(transcriberScript); err != nil {
-			log.Fatalf("Failed to write transcriber script: %v", err)
-		}
-		if err := tmpFile.Close(); err != nil {
-			log.Fatalf("Failed to close temp transcriber file: %v", err)
-		}
-
-		log.Println("Initializing Audio Transcription Engine...")
-		audioListener, err = audio.NewListener(tmpFile.Name())
-		if err != nil {
-			log.Printf("Warning: Failed to create audio listener: %v", err)
-		} else {
-			defer audioListener.Stop()
-		}
+	audioListener := initAudioListener(*useVoice)
+	if audioListener != nil {
+		defer audioListener.Stop()
 	}
 
 	if isEchoMode {
@@ -579,126 +528,4 @@ func outputChat(name, text string, isDead bool, originalLine string) {
 		prefix = "*DEAD* "
 	}
 	fmt.Printf("\033[1;32m%s%s : %s\033[0m\n", prefix, name, text)
-}
-
-func findLogFile() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("could not get user home directory: %v", err)
-	}
-	var potentialPaths []string
-	switch runtime.GOOS {
-	case "windows":
-		potentialPaths = []string{
-			`C:\Program Files (x86)\Steam\steamapps\common\Counter-Strike Global Offensive\game\csgo\console.log`,
-			`D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\csgo\console.log`,
-		}
-	case "linux":
-		potentialPaths = []string{
-			filepath.Join(home, ".steam/steam/steamapps/common/Counter-Strike Global Offensive/game/csgo/console.log"),
-			filepath.Join(home, ".local/share/Steam/steamapps/common/Counter-Strike Global Offensive/game/csgo/console.log"),
-		}
-	case "darwin":
-		potentialPaths = []string{
-			filepath.Join(home, "Library/Application Support/Steam/steamapps/common/Counter-Strike Global Offensive/game/csgo/console.log"),
-		}
-	default:
-		return "", fmt.Errorf("unsupported OS: %s", runtime.GOOS)
-	}
-	for _, p := range potentialPaths {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
-	}
-	return "", fmt.Errorf("could not find console.log in common locations for %s", runtime.GOOS)
-}
-
-func checkCondebug(scanner *bufio.Scanner) error {
-	// ... Simplified version of original checkCondebug ...
-	// Since original was long and mostly heuristics, I'll copy the core logic
-	// But to save space and tokens, I'll rely on the fact that the user can skip it.
-	// Actually, let's copy the full logic to ensure feature parity.
-
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-	var dataPaths []string
-	switch runtime.GOOS {
-	case "windows":
-		dataPaths = []string{`C:\Program Files (x86)\Steam\userdata`}
-	case "linux":
-		dataPaths = []string{
-			filepath.Join(home, ".steam/steam/userdata"),
-			filepath.Join(home, ".local/share/Steam/userdata"),
-		}
-	case "darwin":
-		dataPaths = []string{filepath.Join(home, "Library/Application Support/Steam/userdata")}
-	}
-
-	foundConfig := false
-	configured := false
-
-	for _, dataPath := range dataPaths {
-		entries, err := os.ReadDir(dataPath)
-		if err != nil {
-			continue
-		}
-		for _, entry := range entries {
-			if !entry.IsDir() {
-				continue
-			}
-			configPath := filepath.Join(dataPath, entry.Name(), "config", "localconfig.vdf")
-			contentBytes, err := os.ReadFile(configPath)
-			if err != nil {
-				continue
-			}
-			foundConfig = true
-			if strings.Contains(string(contentBytes), "-condebug") {
-				configured = true // naive check
-				break
-			}
-		}
-		if configured {
-			break
-		}
-	}
-
-	if !foundConfig {
-		fmt.Println("Warning: Could not verify launch options.")
-		return nil
-	}
-
-	if !configured {
-		fmt.Println("CS2 launch option '-condebug' not detected.")
-		fmt.Printf("Do you want to open Steam properties for CS2 to set it? [Y/n]: ")
-		if scanner.Scan() {
-			text := strings.TrimSpace(scanner.Text())
-			if text == "" || strings.ToLower(text) == "y" || strings.ToLower(text) == "yes" {
-				return openSteamSettings()
-			}
-		}
-	}
-	return nil
-}
-
-func openSteamSettings() error {
-	url := "steam://gameproperties/730"
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "linux":
-		cmd = exec.Command("xdg-open", url)
-	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", url)
-	case "darwin":
-		cmd = exec.Command("open", url)
-	default:
-		return fmt.Errorf("unsupported OS")
-	}
-	return cmd.Start()
-}
-
-func stopDockerContainer() {
-	cmd := exec.Command("docker", "stop", "cs-translate")
-	cmd.Run()
 }
