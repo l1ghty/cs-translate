@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -159,6 +160,8 @@ func sliceAudioFile(inputPath, tmpDir string, listener *audio.Listener) {
 
 		slicePath := filepath.Join(tmpDir, fmt.Sprintf("slice_%d.wav", time.Now().UnixNano()))
 
+		// log.Printf("Slicing audio: %s -> %s", inputPath, slicePath)
+
 		sliceCmd := exec.Command("ffmpeg", "-sseof", "-15", "-i", inputPath, "-c", "copy", "-y", slicePath)
 		if out, err := sliceCmd.CombinedOutput(); err != nil {
 			log.Printf("Quick slice failed, trying re-encode: %v", err)
@@ -170,19 +173,32 @@ func sliceAudioFile(inputPath, tmpDir string, listener *audio.Listener) {
 		}
 
 		absPath, _ := filepath.Abs(slicePath)
+		// log.Printf("Submitting file: %s", absPath)
 		listener.SubmitFile(absPath)
 	}()
 }
 
-func stopRecordingGracefully(cmd *exec.Cmd) {
+func stopRecordingGracefully(cmd *exec.Cmd, stdin io.WriteCloser) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
 
-	if runtime.GOOS == "windows" {
-		cmd.Process.Kill()
+	if stdin != nil {
+		if _, err := stdin.Write([]byte("q")); err != nil {
+			// Write failed, process might be dead or stuck, try signal
+			if runtime.GOOS == "windows" {
+				cmd.Process.Kill()
+			} else {
+				cmd.Process.Signal(syscall.SIGTERM)
+			}
+		}
+		stdin.Close()
 	} else {
-		cmd.Process.Signal(syscall.SIGTERM)
+		if runtime.GOOS == "windows" {
+			cmd.Process.Kill()
+		} else {
+			cmd.Process.Signal(syscall.SIGTERM)
+		}
 	}
 
 	done := make(chan error, 1)
@@ -190,8 +206,14 @@ func stopRecordingGracefully(cmd *exec.Cmd) {
 	select {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
+		log.Println("Warning: ffmpeg process did not exit in time, killing...")
 		cmd.Process.Kill()
-		<-done
+		// Don't block forever if it's truly stuck, though this leaks a goroutine
+		select {
+		case <-done:
+		case <-time.After(1 * time.Second):
+			log.Println("Error: ffmpeg process stuck even after Kill")
+		}
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -48,6 +49,7 @@ func main() {
 	isEchoMode := mode == "2"
 
 	var preRecCmd *exec.Cmd
+	var preRecStdin io.WriteCloser
 	var preRecDir string
 	var preRecPath string
 
@@ -64,7 +66,7 @@ func main() {
 
 		// Context for recording (separate from main ctx which might be cancelled?)
 		// Actually use background context for now
-		preRecCmd, err = startAudioRecording(context.Background(), preRecPath, *audioDevice)
+		preRecCmd, preRecStdin, err = startAudioRecording(context.Background(), preRecPath, *audioDevice)
 		if err != nil {
 			log.Printf("Warning: Failed to start early recording: %v", err)
 		} else {
@@ -97,12 +99,10 @@ func main() {
 		if audioListener == nil {
 			log.Fatal("Echo mode requires working audio transcription. Please ensure dependencies are met.")
 		}
-		runEchoMode(ctx, scanner, tr, audioListener, *logPath, *audioDevice, preRecCmd, preRecDir, preRecPath)
+		runEchoMode(ctx, scanner, tr, audioListener, *logPath, *audioDevice, preRecCmd, preRecStdin, preRecDir, preRecPath)
 	} else {
 		// Clean up pre-recording if it happened (shouldn't happen here but safe)
-		if preRecCmd != nil && preRecCmd.Process != nil {
-			preRecCmd.Process.Kill()
-		}
+		stopRecordingGracefully(preRecCmd, preRecStdin)
 		if preRecDir != "" {
 			os.RemoveAll(preRecDir)
 		}
@@ -110,7 +110,7 @@ func main() {
 	}
 }
 
-func startAudioRecording(ctx context.Context, path, device string) (*exec.Cmd, error) {
+func startAudioRecording(ctx context.Context, path, device string) (*exec.Cmd, io.WriteCloser, error) {
 	source := device
 	if source == "" || source == "default" {
 		if runtime.GOOS == "linux" {
@@ -134,13 +134,19 @@ func startAudioRecording(ctx context.Context, path, device string) (*exec.Cmd, e
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	// Suppress stderr to avoid spam, but keep it for debugging if needed
 	// cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start ffmpeg: %w", err)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get stdin pipe: %w", err)
 	}
-	return cmd, nil
+
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("failed to start ffmpeg: %w", err)
+	}
+	return cmd, stdin, nil
 }
 
-func runEchoMode(ctx context.Context, scanner *bufio.Scanner, tr *translator.OllamaTranslator, listener *audio.Listener, logPath string, device string, initialCmd *exec.Cmd, tmpDir string, initialPath string) {
+func runEchoMode(ctx context.Context, scanner *bufio.Scanner, tr *translator.OllamaTranslator, listener *audio.Listener, logPath string, device string, initialCmd *exec.Cmd, initialStdin io.WriteCloser, tmpDir string, initialPath string) {
 	fmt.Println("\n=== Echo Mode Started ===")
 	fmt.Println("Listening to system output audio + Monitoring CS2 Console...")
 	fmt.Println("Press F9 to capture the last 15 seconds, transcribe, and translate.")
@@ -191,18 +197,17 @@ func runEchoMode(ctx context.Context, scanner *bufio.Scanner, tr *translator.Oll
 	}
 
 	currentCmd := initialCmd
+	currentStdin := initialStdin
 	if currentCmd == nil {
 		var err error
-		currentCmd, err = startAudioRecording(ctx, currentRecPath, device)
+		currentCmd, currentStdin, err = startAudioRecording(ctx, currentRecPath, device)
 		if err != nil {
 			log.Printf("Failed to start recording: %v", err)
 		}
 	}
 
 	defer func() {
-		if currentCmd != nil && currentCmd.Process != nil {
-			currentCmd.Process.Kill()
-		}
+		stopRecordingGracefully(currentCmd, currentStdin)
 		stopDockerContainer()
 	}()
 
@@ -249,11 +254,11 @@ func runEchoMode(ctx context.Context, scanner *bufio.Scanner, tr *translator.Oll
 		case <-hk.KeyPressed():
 			fmt.Println("\n[F9] Capturing...")
 
-			stopRecordingGracefully(currentCmd)
+			stopRecordingGracefully(currentCmd, currentStdin)
 
 			if _, err := os.Stat(currentRecPath); os.IsNotExist(err) {
 				log.Printf("Recording file not found: %s (Audio capture might have failed to start)", currentRecPath)
-				currentCmd, _ = startAudioRecording(ctx, currentRecPath, device)
+				currentCmd, currentStdin, _ = startAudioRecording(ctx, currentRecPath, device)
 				continue
 			}
 
@@ -262,11 +267,11 @@ func runEchoMode(ctx context.Context, scanner *bufio.Scanner, tr *translator.Oll
 			if err := renameWithRetry(currentRecPath, lastRecPath); err != nil {
 				log.Printf("Failed to rename recording file: %v", err)
 				os.Remove(currentRecPath)
-				currentCmd, _ = startAudioRecording(ctx, currentRecPath, device)
+				currentCmd, currentStdin, _ = startAudioRecording(ctx, currentRecPath, device)
 				continue
 			}
 
-			currentCmd, _ = startAudioRecording(ctx, currentRecPath, device)
+			currentCmd, currentStdin, _ = startAudioRecording(ctx, currentRecPath, device)
 
 			sliceAudioFile(lastRecPath, tmpDir, listener)
 

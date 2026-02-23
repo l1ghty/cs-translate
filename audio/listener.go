@@ -342,12 +342,19 @@ func (l *Listener) worker() {
 
 		// Check if audio is silent before transcribing
 		if l.isSilent(path) {
+			if strings.Contains(path, "slice_") {
+				log.Printf("Audio file '%s' is silent, skipping transcription.", filepath.Base(path))
+			}
 			os.Remove(path)
 			continue
 		}
 
 		// Start timing for transcription
 		transcribeStart := time.Now()
+
+		if strings.Contains(path, "slice_") {
+			log.Printf("Sending file '%s' to transcriber...", filepath.Base(path))
+		}
 
 		// Send to python
 		// We hold a lock just in case, though this is the only writer
