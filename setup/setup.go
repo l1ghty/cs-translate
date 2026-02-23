@@ -7,8 +7,10 @@ import (
 	"os"
 )
 
+//go:embed Dockerfile
 var dockerfileContent []byte
 
+//go:embed transcriber.py
 var transcriberScript []byte
 
 func EnsureEnvironment(scanner *bufio.Scanner, useVoice bool) error {

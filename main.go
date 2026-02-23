@@ -203,6 +203,7 @@ func runEchoMode(ctx context.Context, scanner *bufio.Scanner, tr *translator.Oll
 		if currentCmd != nil && currentCmd.Process != nil {
 			currentCmd.Process.Kill()
 		}
+		stopDockerContainer()
 	}()
 
 	// Hotkey Listener

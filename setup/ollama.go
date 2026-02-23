@@ -140,7 +140,6 @@ func InstallOllama(scanner *bufio.Scanner) error {
 	ln, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", port))
 	if err != nil {
 		fmt.Printf("Port %d is already in use. Looking for an available port...\n", port)
-		ln.Close()
 		port, err = translator.FindAvailablePort(port + 1)
 		if err != nil {
 			return fmt.Errorf("could not find an available port: %w", err)

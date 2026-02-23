@@ -108,23 +108,22 @@ func buildAndRunContainer(name string) error {
 	volCreateCmd := exec.Command("docker", "volume", "create", "cs-translate-models")
 	volCreateCmd.Run()
 
-	port := translator.DefaultOllamaPort
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	hostPort := translator.DefaultOllamaPort
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", hostPort))
 	if err != nil {
-		fmt.Printf("Port %d is already in use. Looking for an available port...\n", port)
-		ln.Close()
-		port, err = translator.FindAvailablePort(port + 1)
+		fmt.Printf("Port %d is already in use. Looking for an available port...\n", hostPort)
+		hostPort, err = translator.FindAvailablePort(hostPort + 1)
 		if err != nil {
 			return fmt.Errorf("could not find an available port: %w", err)
 		}
-		fmt.Printf("Using alternative port: %d\n", port)
+		fmt.Printf("Using alternative port: %d\n", hostPort)
 		fmt.Println("Note: You'll need to set OLLAMA_HOST to use this port.")
-		fmt.Printf("Run: export OLLAMA_HOST=http://localhost:%d\n", port)
+		fmt.Printf("Run: export OLLAMA_HOST=http://localhost:%d\n", hostPort)
 	} else {
 		ln.Close()
 	}
 
-	portStr := fmt.Sprintf("%d:%d", port, translator.DefaultOllamaPort)
+	portStr := fmt.Sprintf("%d:%d", hostPort, translator.DefaultOllamaPort)
 	runCmd := exec.Command("docker", "run", "-d",
 		"--gpus", "all",
 		"--name", name,
