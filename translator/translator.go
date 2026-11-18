@@ -52,9 +52,14 @@ type VoiceContext struct {
 	ContextText string // Recent transcriptions from last 10 seconds
 }
 
-// keepAlive keeps the model loaded for a whole match: reloading it from disk
-// after Ollama's default 5 idle minutes causes a CPU/disk spike mid-game.
+// keepAlive keeps the model loaded between translations: reloading it from
+// disk after Ollama's default 5 idle minutes causes a CPU/disk spike mid-game
+// and a slow translation. KeepWarm renews it while the tool runs; if the tool
+// dies without unloading the model, Ollama frees it after this time.
 const keepAlive = "30m"
+
+// keepWarmEvery renews keepAlive well before it runs out.
+const keepWarmEvery = 10 * time.Minute
 
 // NewOllamaTranslator creates a new Ollama translator
 func NewOllamaTranslator(ctx context.Context, model, targetLang string, opts Options) (*OllamaTranslator, error) {
@@ -110,7 +115,42 @@ Translate the following text to %s. Use the context above to understand the conv
 	return translation, nil
 }
 
-func (t *OllamaTranslator) generate(ctx context.Context, prompt string) (string, error) {
+// Preload loads the model into memory and runs one tiny translation, so the
+// first real translation is answered immediately instead of waiting for the
+// model to load. Loading can take from a second to a few minutes (large
+// model, slow disk), so this should be called at startup.
+func (t *OllamaTranslator) Preload(ctx context.Context) error {
+	if err := t.load(ctx); err != nil {
+		return err
+	}
+	_, err := t.Translate(ctx, "Good luck, have fun!") // warms up prompt processing
+	return err
+}
+
+// KeepWarm keeps the model loaded until ctx is done, so translations stay
+// instant even after long quiet periods.
+func (t *OllamaTranslator) KeepWarm(ctx context.Context) {
+	tick := time.NewTicker(keepWarmEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			t.load(ctx)
+		}
+	}
+}
+
+// load asks Ollama to load the model (a request without a prompt only loads
+// it), with the same options as translations so Ollama doesn't reload it.
+func (t *OllamaTranslator) load(ctx context.Context) error {
+	client := &http.Client{Timeout: 10 * time.Minute} // first load from a slow disk can take long
+	_, err := t.request(ctx, client, "")
+	return err
+}
+
+func (t *OllamaTranslator) options() map[string]any {
 	options := map[string]any{"temperature": 0.3}
 	if t.opts.CPUOnly {
 		options["num_gpu"] = 0
@@ -118,11 +158,19 @@ func (t *OllamaTranslator) generate(ctx context.Context, prompt string) (string,
 	if t.opts.Threads > 0 {
 		options["num_thread"] = t.opts.Threads
 	}
+	return options
+}
+
+func (t *OllamaTranslator) generate(ctx context.Context, prompt string) (string, error) {
+	return t.request(ctx, t.httpClient, prompt)
+}
+
+func (t *OllamaTranslator) request(ctx context.Context, client *http.Client, prompt string) (string, error) {
 	body, err := json.Marshal(ollamaRequest{
 		Model:     t.model,
 		Prompt:    prompt,
 		KeepAlive: keepAlive,
-		Options:   options,
+		Options:   t.options(),
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal request: %w", err)
@@ -134,7 +182,7 @@ func (t *OllamaTranslator) generate(ctx context.Context, prompt string) (string,
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := t.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to send request: %w", err)
 	}

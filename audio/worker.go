@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -46,17 +47,40 @@ type Config struct {
 	AudioDevice string // capture device name/substring; "" = what you hear (loopback)
 	Live        bool   // continuously transcribe speech; otherwise only on Capture()
 	BufferSecs  int    // seconds of audio kept in memory for Capture()
+
+	// Progress, if set, is called with what the worker is doing while it
+	// starts: installing packages, downloading and loading the model.
+	Progress func(Progress)
 }
 
-// Transcript is a piece of recognised speech.
+// Progress describes a step of the worker's startup. Total > 0 means the
+// step can show a progress bar (Unit "B" = bytes).
+type Progress struct {
+	Message     string
+	Done, Total int64
+	Unit        string
+}
+
+// Kind tells what a Transcript event means.
+type Kind int
+
+const (
+	KindText  Kind = iota // recognised speech in Text
+	KindStart             // a transcription job started (Pieces utterances)
+	KindDone              // a transcription job finished (Found: any speech)
+)
+
+// Transcript is a piece of recognised speech, or the start/end of a job.
 type Transcript struct {
+	Kind                Kind    `json:"-"`
 	Source              string  `json:"source"` // "live" or "capture"
 	Text                string  `json:"text"`
 	Language            string  `json:"language"`
 	LanguageProbability float64 `json:"language_probability"`
 	AudioSeconds        float64 `json:"audio_seconds"`
 	ProcessingSeconds   float64 `json:"processing_seconds"`
-	Empty               bool    `json:"-"` // a Capture() found no speech
+	Pieces              int     `json:"pieces"` // KindStart: utterances found in the audio
+	Found               bool    `json:"found"`  // KindDone: the job produced text
 }
 
 // Device is an audio input the worker can record from.
@@ -83,6 +107,9 @@ type event struct {
 	Fatal   bool     `json:"fatal"`
 	Devices []Device `json:"devices"`
 	Default string   `json:"default"`
+	Done    int64    `json:"done"`
+	Total   int64    `json:"total"`
+	Unit    string   `json:"unit"`
 }
 
 // Worker is a running speech-to-text worker process.
@@ -196,50 +223,176 @@ func (c Config) command(ctx context.Context, extra ...string) (*exec.Cmd, error)
 		"HF_HUB_DISABLE_SYMLINKS_WARNING=1",
 		"HF_HUB_VERBOSITY=error",
 	)
-	cmd.Stderr = os.Stderr // install progress, model download and worker logs
 	return cmd, nil
 }
 
-// Start launches the worker and waits until the model is loaded. The first
-// start installs Python packages and downloads the model, which can take a
-// few minutes; later starts take a second or two.
-func Start(ctx context.Context, cfg Config) (*Worker, error) {
-	cfg = cfg.Resolve()
-	cmd, err := cfg.command(ctx)
+// process is a started worker with its output being parsed.
+type process struct {
+	cmd    *exec.Cmd
+	events chan event    // protocol events from stdout; closed at EOF
+	logs   chan struct{} // closed when stderr is drained
+	cfg    Config
+
+	mu      sync.Mutex
+	ready   bool     // after "ready", stderr lines are logged instead of shown as progress
+	started bool     // the Python worker itself is running (uv finished installing)
+	tail    []string // last stderr lines, shown if startup fails
+}
+
+func (c Config) spawn(ctx context.Context, withStdin bool, extra ...string) (*process, io.WriteCloser, error) {
+	cmd, err := c.command(ctx, extra...)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
+	var stdin io.WriteCloser
+	if withStdin {
+		if stdin, err = cmd.StdinPipe(); err != nil {
+			return nil, nil, err
+		}
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, nil, err
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("starting speech worker: %w", err)
+		return nil, nil, fmt.Errorf("starting speech worker: %w", err)
 	}
+	p := &process{cmd: cmd, events: make(chan event, 16), logs: make(chan struct{}), cfg: c}
+	p.progress(Progress{Message: "Starting speech engine"})
+	go p.readStdout(stdout)
+	go p.readStderr(stderr)
+	return p, stdin, nil
+}
 
+func (p *process) progress(pr Progress) {
+	if p.cfg.Progress != nil {
+		p.cfg.Progress(pr)
+	}
+}
+
+func (p *process) readStdout(r io.Reader) {
+	defer close(p.events)
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	for sc.Scan() {
+		var ev event
+		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil || ev.Event == "" {
+			continue // not a protocol line
+		}
+		p.mu.Lock()
+		p.started = true
+		ready := p.ready
+		p.mu.Unlock()
+		switch ev.Event {
+		case "status":
+			if !ready {
+				p.progress(Progress{Message: ev.Message})
+			}
+			continue
+		case "progress":
+			if !ready {
+				p.progress(Progress{Message: ev.Message, Done: ev.Done, Total: ev.Total, Unit: ev.Unit})
+			}
+			continue
+		case "ready":
+			p.mu.Lock()
+			p.ready = true
+			p.mu.Unlock()
+		}
+		p.events <- ev
+	}
+}
+
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+
+// readStderr shows uv's install messages and the worker's logs as progress
+// during startup, and logs them afterwards.
+func (p *process) readStderr(r io.Reader) {
+	defer close(p.logs)
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	sc.Split(scanLinesCR)
+	for sc.Scan() {
+		line := strings.TrimSpace(ansiRe.ReplaceAllString(sc.Text(), ""))
+		if line == "" {
+			continue
+		}
+		p.mu.Lock()
+		ready, started := p.ready, p.started
+		p.tail = append(p.tail, line)
+		if len(p.tail) > 15 {
+			p.tail = p.tail[1:]
+		}
+		p.mu.Unlock()
+		switch {
+		case ready:
+			log.Printf("%s", line)
+		case !started:
+			// before Python runs, everything on stderr comes from uv
+			p.progress(Progress{Message: "Installing speech engine: " + line})
+		default:
+			p.progress(Progress{Message: strings.TrimPrefix(line, "[speech] ")})
+		}
+	}
+}
+
+// scanLinesCR splits on \n and \r, so progress output redrawn with \r becomes separate lines.
+func scanLinesCR(data []byte, atEOF bool) (int, []byte, error) {
+	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
+
+// startupError explains why the worker failed before becoming ready,
+// including its last messages.
+func (p *process) startupError(err error) error {
+	<-p.logs
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.tail) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w\nLast messages from the speech engine:\n  %s", err, strings.Join(p.tail, "\n  "))
+}
+
+// Start launches the worker and waits until the model is loaded and warmed
+// up, so the first transcription is fast. The first start installs Python
+// packages and downloads the model, which can take a few minutes (reported
+// through cfg.Progress); later starts take a few seconds.
+func Start(ctx context.Context, cfg Config) (*Worker, error) {
+	cfg = cfg.Resolve()
+	p, stdin, err := cfg.spawn(ctx, true)
+	if err != nil {
+		return nil, err
+	}
 	w := &Worker{
-		cmd:         cmd,
+		cmd:         p.cmd,
 		stdin:       stdin,
 		transcripts: make(chan Transcript, 16),
 		exited:      make(chan struct{}),
 	}
-
-	ready := make(chan error, 1)
-	go w.read(stdout, ready)
 	go func() {
-		cmd.Wait()
+		<-p.logs // drain stderr before Wait closes the pipe
+		p.cmd.Wait()
 		close(w.exited)
 	}()
+
+	ready := make(chan error, 1)
+	go w.read(p.events, ready)
 
 	select {
 	case err := <-ready:
 		if err != nil {
 			w.Close()
-			return nil, err
+			return nil, p.startupError(err)
 		}
 		return w, nil
 	case <-ctx.Done():
@@ -248,10 +401,8 @@ func Start(ctx context.Context, cfg Config) (*Worker, error) {
 	}
 }
 
-func (w *Worker) read(stdout io.Reader, ready chan<- error) {
+func (w *Worker) read(events <-chan event, ready chan<- error) {
 	defer close(w.transcripts)
-	sc := bufio.NewScanner(stdout)
-	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	isReady := false
 	signal := func(err error) {
 		if !isReady {
@@ -259,21 +410,25 @@ func (w *Worker) read(stdout io.Reader, ready chan<- error) {
 			ready <- err
 		}
 	}
-	defer signal(errors.New("speech worker exited during startup (see messages above)"))
+	defer signal(errors.New("speech worker exited during startup"))
 
-	for sc.Scan() {
-		var ev event
-		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
-			continue // not a protocol line
-		}
+	for ev := range events {
 		switch ev.Event {
 		case "ready":
 			w.Info = ev.Info
 			signal(nil)
+		case "job_start":
+			t := ev.Transcript
+			t.Kind = KindStart
+			w.transcripts <- t
 		case "transcript":
-			w.transcripts <- ev.Transcript
-		case "empty":
-			w.transcripts <- Transcript{Source: ev.Source, Empty: true}
+			t := ev.Transcript
+			t.Kind = KindText
+			w.transcripts <- t
+		case "job_done":
+			t := ev.Transcript
+			t.Kind = KindDone
+			w.transcripts <- t
 		case "warning":
 			log.Printf("Speech: %s", ev.Message)
 		case "error":
@@ -286,10 +441,13 @@ func (w *Worker) read(stdout io.Reader, ready chan<- error) {
 	}
 }
 
-// Transcripts delivers recognised speech. It is closed when the worker exits.
+// Transcripts delivers recognised speech and job start/end events. It is
+// closed when the worker exits.
 func (w *Worker) Transcripts() <-chan Transcript { return w.transcripts }
 
-// Capture transcribes the last `seconds` of audio (the result arrives on Transcripts).
+// Capture transcribes the last `seconds` of audio. The worker answers on
+// Transcripts with a KindStart event, a KindText event per utterance and a
+// KindDone event.
 func (w *Worker) Capture(seconds int) error {
 	return w.send(fmt.Sprintf("capture %d", seconds))
 }
@@ -320,32 +478,34 @@ func (w *Worker) Close() {
 
 // runOnce runs the worker in a one-shot mode and returns the first event of the given kind.
 func runOnce(ctx context.Context, cfg Config, want string, extra ...string) (*event, error) {
-	cmd, err := cfg.Resolve().command(ctx, extra...)
+	p, _, err := cfg.Resolve().spawn(ctx, false, extra...)
 	if err != nil {
 		return nil, err
 	}
-	cmd.Stdin = nil
-	out, runErr := cmd.Output()
-	var last *event
-	for _, line := range strings.Split(string(out), "\n") {
-		var ev event
-		if json.Unmarshal([]byte(line), &ev) != nil {
-			continue
-		}
-		if ev.Event == want {
-			return &ev, nil
-		}
-		if ev.Event == "error" {
-			last = &ev
+	var found, last *event
+	for ev := range p.events {
+		switch {
+		case ev.Event == want && found == nil:
+			e := ev
+			found = &e
+		case ev.Event == "error":
+			e := ev
+			last = &e
+		case ev.Event == "warning":
+			log.Printf("Speech: %s", ev.Message)
 		}
 	}
-	if last != nil {
-		return nil, fmt.Errorf("speech worker: %s", last.Message)
+	<-p.logs
+	runErr := p.cmd.Wait()
+	switch {
+	case found != nil:
+		return found, nil
+	case last != nil:
+		return nil, p.startupError(fmt.Errorf("speech worker: %s", last.Message))
+	case runErr != nil:
+		return nil, p.startupError(fmt.Errorf("speech worker failed: %w", runErr))
 	}
-	if runErr != nil {
-		return nil, fmt.Errorf("speech worker failed: %w", runErr)
-	}
-	return nil, errors.New("speech worker returned no result")
+	return nil, p.startupError(errors.New("speech worker returned no result"))
 }
 
 // ListDevices returns the audio devices the worker can record from and the

@@ -18,8 +18,8 @@ runs Whisper when the VAD has found speech (live mode) or when asked to
 (capture mode).
 
 Protocol (driven by the Go host):
-  stdout  one JSON object per line ("event": ready | transcript | empty |
-          devices | error | warning)
+  stdout  one JSON object per line ("event": status | progress | ready |
+          job_start | transcript | job_done | devices | error | warning)
   stdin   one command per line: "capture <seconds>" or "quit". EOF = quit.
   stderr  human-readable logs (passed through to the terminal).
 """
@@ -63,6 +63,11 @@ def emit(event, **fields):
 
 def log(msg):
     print(f"[speech] {msg}", file=sys.stderr, flush=True)
+
+
+def status(msg):
+    """Tell the host what is happening (shown next to its spinner)."""
+    emit("status", message=msg)
 
 
 def lower_priority():
@@ -324,9 +329,104 @@ def capture_loop(sc, np, args, ring, segmenter, stop):
 # --------------------------------------------------------------------------
 
 
+class DownloadProgress:
+    """Collects the progress bars huggingface_hub creates while downloading
+    and reports overall progress to the host as "progress" events.
+
+    Depending on the huggingface_hub version the bars passed through
+    `tqdm_class` count bytes or only files; bytes are preferred."""
+
+    def __init__(self, message):
+        self.message = message
+        self.bars = []
+        self.lock = threading.Lock()
+        self.last = 0.0
+
+    def report(self, force=False):
+        now = time.monotonic()
+        with self.lock:
+            if not force and now - self.last < 0.2:
+                return
+            self.last = now
+            bars = list(self.bars)
+        byte_bars = [b for b in bars if b.unit == "B" and (b.total or 0) > 0]
+        use = byte_bars or [b for b in bars if (b.total or 0) > 0]
+        if not use:
+            return
+        total = max(int(b.total) for b in use)
+        done = max(min(int(b.n), int(b.total)) for b in use)
+        emit("progress", message=self.message, done=done, total=total, unit="B" if byte_bars else "files")
+
+    def tqdm_class(self):
+        from tqdm import tqdm
+
+        reporter = self
+        devnull = open(os.devnull, "w")
+
+        class ReportingTqdm(tqdm):
+            def __init__(self, *a, **kw):
+                kw.pop("name", None)  # only huggingface_hub's own tqdm accepts it
+                kw["file"] = devnull
+                kw["disable"] = False
+                super().__init__(*a, **kw)
+                with reporter.lock:
+                    reporter.bars.append(self)
+
+            def update(self, n=1):
+                r = super().update(n)
+                reporter.report()
+                return r
+
+            def refresh(self, *a, **kw):
+                r = super().refresh(*a, **kw)
+                reporter.report()
+                return r
+
+        return ReportingTqdm
+
+
+MODEL_FILES = ["config.json", "preprocessor_config.json", "model.bin", "tokenizer.json", "vocabulary.*"]
+
+
+def ensure_model(args):
+    """Return a local path to the Whisper model, downloading it (with progress
+    reports) when it is not cached yet. Cached models start without any
+    network access."""
+    from faster_whisper import utils as fw_utils
+
+    name = args.model
+    if os.path.isdir(name):
+        return name
+    cache_dir = args.models_dir or None
+    status(f"Checking Whisper model '{name}'")
+    try:
+        return fw_utils.download_model(name, local_files_only=True, cache_dir=cache_dir)
+    except ValueError:
+        raise  # unknown model name
+    except Exception:
+        pass  # not downloaded yet
+
+    message = f"Downloading Whisper model '{name}' (one-time)"
+    status(message)
+    try:
+        import huggingface_hub
+
+        repo_id = name if "/" in name else fw_utils._MODELS[name]
+        progress = DownloadProgress(message)
+        path = huggingface_hub.snapshot_download(
+            repo_id, cache_dir=cache_dir, allow_patterns=MODEL_FILES, tqdm_class=progress.tqdm_class())
+        progress.report(force=True)
+        return path
+    except Exception as e:
+        log(f"download with progress failed ({type(e).__name__}: {e}), retrying")
+        return fw_utils.download_model(name, cache_dir=cache_dir)
+
+
 def load_model(args):
     from faster_whisper import WhisperModel
 
+    path = ensure_model(args)
+    status(f"Loading Whisper model '{args.model}' into memory")
     device = args.device
     if device in ("cuda", "auto"):
         preload_cuda_libs()
@@ -335,8 +435,7 @@ def load_model(args):
 
             if ctranslate2.get_cuda_device_count() > 0:
                 compute = args.compute_type or "int8_float16"
-                model = WhisperModel(args.model, device="cuda", compute_type=compute,
-                                     download_root=args.models_dir or None)
+                model = WhisperModel(path, device="cuda", compute_type=compute)
                 return model, "cuda", compute
             if device == "cuda":
                 emit("warning", message="no CUDA GPU usable, falling back to CPU")
@@ -344,10 +443,21 @@ def load_model(args):
             emit("warning", message=f"GPU init failed ({e}), falling back to CPU")
 
     compute = args.compute_type or "int8"
-    model = WhisperModel(args.model, device="cpu", compute_type=compute,
-                         cpu_threads=args.threads, num_workers=1,
-                         download_root=args.models_dir or None)
+    model = WhisperModel(path, device="cpu", compute_type=compute,
+                         cpu_threads=args.threads, num_workers=1)
     return model, "cpu", compute
+
+
+def warm_up(np, model, languages):
+    """Run the VAD and Whisper once on a little noise, so the first real
+    transcription doesn't pay for lazy loading and first-call setup."""
+    status("Warming up speech recognition")
+    try:
+        noise = (np.random.default_rng(0).standard_normal(SAMPLE_RATE) * 0.01).astype(np.float32)
+        split_speech(noise)  # loads the Silero VAD model used by captures
+        transcribe(model, languages, noise)
+    except Exception as e:  # never fatal: real requests will just be slower
+        emit("warning", message=f"speech warm-up failed: {e}")
 
 
 def _decode(model, audio, language):
@@ -396,15 +506,20 @@ def split_speech(audio):
     return [audio[c["start"]:c["end"]] for c in chunks if c["end"] - c["start"] >= SAMPLE_RATE // 4]
 
 
+def parse_languages(spec):
+    return [l.strip().lower() for l in spec.split(",") if l.strip()]
+
+
 def asr_loop(model, args, jobs):
-    languages = [l.strip().lower() for l in args.language.split(",") if l.strip()]
+    languages = parse_languages(args.language)
     while True:
         source, audio = jobs.get()
         if source == "quit":
             return
+        found = False
         try:
             pieces = split_speech(audio) if source == "capture" else [audio]
-            found = False
+            emit("job_start", source=source, pieces=len(pieces))
             for piece in pieces:
                 if len(piece) < SAMPLE_RATE // 4:
                     continue
@@ -415,10 +530,10 @@ def asr_loop(model, args, jobs):
                 emit("transcript", source=source, text=text,
                      language=language, language_probability=round(probability, 3),
                      audio_seconds=round(len(piece) / SAMPLE_RATE, 2), processing_seconds=round(took, 2))
-            if not found and source == "capture":
-                emit("empty", source=source)
         except Exception as e:
             emit("error", message=f"transcription failed: {e}", fatal=False)
+        finally:
+            emit("job_done", source=source, found=found)
 
 
 # --------------------------------------------------------------------------
@@ -455,20 +570,23 @@ def main():
     lower_priority()
 
     if args.list_devices:
+        status("Looking for audio devices")
         devices, default = list_devices(open_soundcard())
         emit("devices", devices=devices, default=default)
         return
 
+    status("Starting speech engine")
     import numpy as np
 
     # Resolve the audio device first so a missing loopback device fails fast.
     sc, audio_name = None, ""
     if not args.no_capture and not args.prepare:
+        status("Opening audio device")
         sc = open_soundcard()
         audio_name = resolve_device(sc, args.audio_device).name
 
-    log(f"loading Whisper model '{args.model}' (first run downloads it)...")
     model, device, compute = load_model(args)
+    warm_up(np, model, parse_languages(args.language))
 
     if args.prepare:
         emit("ready", model=args.model, device=device, compute_type=compute, threads=args.threads, audio_device="")

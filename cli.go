@@ -11,6 +11,7 @@ import (
 	"github.com/micha/cs-ingame-translate/audio"
 	"github.com/micha/cs-ingame-translate/setup"
 	"github.com/micha/cs-ingame-translate/translator"
+	"github.com/micha/cs-ingame-translate/ui"
 )
 
 func listAudioDevices(cfg audio.Config) {
@@ -23,7 +24,10 @@ func listAudioDevices(cfg audio.Config) {
 		log.Fatal(err)
 	}
 	cfg.UV, cfg.DataDir = uv, dir
+	st := ui.Start("Looking for audio devices")
+	cfg.Progress = func(p audio.Progress) { st.Set(p.Message) }
 	devices, def, err := audio.ListDevices(context.Background(), cfg)
+	st.Stop()
 	if err != nil {
 		log.Fatalf("Error listing devices: %v", err)
 	}
@@ -48,8 +52,13 @@ func runSetup(scanner *bufio.Scanner, ollamaModel string, cfg audio.Config) {
 	}
 	cfg.UV, cfg.DataDir = env.UV, env.DataDir
 	cfg = cfg.Resolve()
-	fmt.Printf("Installing speech engine and downloading Whisper '%s' model...\n", cfg.Model)
+	st := ui.Start(fmt.Sprintf("Installing speech engine and Whisper '%s' model", cfg.Model))
+	cfg.Progress = func(p audio.Progress) {
+		st.Set(p.Message)
+		st.Progress(p.Done, p.Total, p.Unit)
+	}
 	info, err := audio.Prepare(context.Background(), cfg)
+	st.Stop()
 	if err != nil {
 		log.Fatalf("Setup failed: %v", err)
 	}
@@ -129,11 +138,16 @@ func (v *voiceTranslator) contextText(now time.Time) string {
 	return strings.Join(parts, "\n")
 }
 
-func (v *voiceTranslator) print(ctx context.Context, t audio.Transcript) {
-	fmt.Printf("\nVoice [%s, %.1fs audio, recognised in %.2fs]: %s\n", t.Language, t.AudioSeconds, t.ProcessingSeconds, t.Text)
+func (v *voiceTranslator) printOriginal(t audio.Transcript) {
+	ui.Printf("\nVoice [%s, %.1fs audio, recognised in %.2fs]: %s\n", t.Language, t.AudioSeconds, t.ProcessingSeconds, t.Text)
+}
+
+// printTranslation translates t and prints the result (nothing if t is
+// already in the target language).
+func (v *voiceTranslator) printTranslation(ctx context.Context, t audio.Transcript) {
 	start := time.Now()
 	translated, didTranslate := v.translate(ctx, t)
 	if didTranslate {
-		fmt.Printf("\033[1;32mTranslated (%.2fs): %s\033[0m\n", time.Since(start).Seconds(), translated)
+		ui.Printf("\033[1;32mTranslated (%.2fs): %s\033[0m\n", time.Since(start).Seconds(), translated)
 	}
 }
