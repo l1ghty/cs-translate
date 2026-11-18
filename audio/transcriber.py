@@ -120,6 +120,10 @@ def open_soundcard():
     try:
         import soundcard as sc
 
+        # soundcard forces its warnings to "always" on import. A discontinuity
+        # (a few ms of audio lost, e.g. when playback resumes after silence)
+        # is harmless for speech recognition, so keep it out of the console.
+        warnings.filterwarnings("ignore", message="data discontinuity")
         sc.all_microphones(include_loopback=True)
         return sc
     except Exception as e:
