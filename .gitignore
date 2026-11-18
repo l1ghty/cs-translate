@@ -32,3 +32,4 @@ Thumbs.db
 # Logs
 *.log
 cs-ingame-translate
+__pycache__/

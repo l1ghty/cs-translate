@@ -3,65 +3,90 @@ package setup
 import (
 	"bufio"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
+	"time"
 )
 
-func PrintManualInstallInstructions(pkg string) {
-	if pkg == "python" {
-		fmt.Println("Please install Python 3.9+ from python.org")
+// AssumeYes answers every setup question with its default ("yes"), for
+// unattended installs (-yes flag).
+var AssumeYes bool
+
+// AppDir is where cs-translate keeps its private tools (uv), the speech
+// worker and downloaded models:
+//
+//	Windows: %LOCALAPPDATA%\cs-translate
+//	macOS:   ~/Library/Caches/cs-translate
+//	Linux:   ~/.cache/cs-translate
+func AppDir() (string, error) {
+	if dir := os.Getenv("CS_TRANSLATE_HOME"); dir != "" {
+		return dir, os.MkdirAll(dir, 0o755)
 	}
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(base, "cs-translate")
+	return dir, os.MkdirAll(dir, 0o755)
 }
 
-func InstallDependency(scanner *bufio.Scanner, pkgName string) error {
-	pm, cmdArgs := detectPackageManager(pkgName)
-	if pm == "" {
-		return fmt.Errorf("no supported package manager found")
+// askYesNo asks a question that defaults to yes.
+func askYesNo(scanner *bufio.Scanner, question string) bool {
+	fmt.Printf("%s [Y/n]: ", question)
+	if AssumeYes {
+		fmt.Println("y")
+		return true
 	}
+	if !scanner.Scan() {
+		return false
+	}
+	in := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	return in == "" || in == "y" || in == "yes"
+}
 
-	fmt.Printf("Package manager '%s' detected.\n", pm)
-	fmt.Printf("Do you want to install '%s' using %s? [Y/n]: ", pkgName, pm)
-	fmt.Scanln()
-
-	fmt.Printf("Running: %s %s\n", pm, cmdArgs)
-	cmd := exec.Command(pm, cmdArgs...)
+func runVisible(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
 	return cmd.Run()
 }
 
-func detectPackageManager(pkgName string) (string, []string) {
-	if runtime.GOOS == "windows" {
-		if _, err := exec.LookPath("winget"); err == nil {
-			id := pkgName
-			if pkgName == "python" {
-				id = "Python.Python.3.11"
-			}
-			return "winget", []string{"install", "-e", "--id", id}
-		}
-		if _, err := exec.LookPath("choco"); err == nil {
-			return "choco", []string{"install", pkgName, "-y"}
-		}
-		if _, err := exec.LookPath("scoop"); err == nil {
-			return "scoop", []string{"install", pkgName}
-		}
-	} else {
-		if _, err := exec.LookPath("apt-get"); err == nil {
-			return "sudo", []string{"apt-get", "install", "-y", pkgName}
-		}
-		if _, err := exec.LookPath("dnf"); err == nil {
-			return "sudo", []string{"dnf", "install", "-y", pkgName}
-		}
-		if _, err := exec.LookPath("pacman"); err == nil {
-			target := pkgName
-			return "sudo", []string{"pacman", "-S", "--noconfirm", target}
-		}
-		if _, err := exec.LookPath("zypper"); err == nil {
-			return "sudo", []string{"zypper", "install", "-y", pkgName}
-		}
+// downloadFile fetches url into dest.
+func downloadFile(url, dest string) error {
+	client := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
 	}
-	return "", nil
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s: %s", url, resp.Status)
+	}
+	out, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+func exeName(name string) string {
+	if runtime.GOOS == "windows" {
+		return name + ".exe"
+	}
+	return name
+}
+
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
 }

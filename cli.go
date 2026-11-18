@@ -4,87 +4,79 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"log"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/micha/cs-ingame-translate/audio"
+	"github.com/micha/cs-ingame-translate/setup"
 	"github.com/micha/cs-ingame-translate/translator"
 )
 
-func listAudioDevices() {
-	fmt.Println(audio.GetDeviceHelpText())
-	devices, err := audio.GetAvailableDevices()
+func listAudioDevices(cfg audio.Config) {
+	uv, err := setup.EnsureUV()
 	if err != nil {
-		fmt.Printf("Error listing devices: %v\n", err)
-	} else {
-		fmt.Println("Available audio devices:")
-		for i, device := range devices {
-			fmt.Printf("  %d. %s\n", i+1, device)
-		}
+		log.Fatal(err)
 	}
-	os.Exit(0)
+	dir, err := setup.AppDir()
+	if err != nil {
+		log.Fatal(err)
+	}
+	cfg.UV, cfg.DataDir = uv, dir
+	devices, def, err := audio.ListDevices(context.Background(), cfg)
+	if err != nil {
+		log.Fatalf("Error listing devices: %v", err)
+	}
+	fmt.Println("Audio devices (pass a name, or part of it, to -audiodevice):")
+	for _, d := range devices {
+		kind := "input   "
+		if d.Loopback {
+			kind = "loopback"
+		}
+		fmt.Printf("  [%s] %s\n", kind, d.Name)
+	}
+	if def != "" {
+		fmt.Printf("Default: loopback of '%s' (what you hear)\n", def)
+	}
+}
+
+// runSetup installs and downloads everything up front (-setup).
+func runSetup(scanner *bufio.Scanner, ollamaModel string, cfg audio.Config) {
+	env, err := setup.EnsureEnvironment(scanner, ollamaModel, true)
+	if err != nil {
+		log.Fatalf("Setup failed: %v", err)
+	}
+	cfg.UV, cfg.DataDir = env.UV, env.DataDir
+	cfg = cfg.Resolve()
+	fmt.Printf("Installing speech engine and downloading Whisper '%s' model...\n", cfg.Model)
+	info, err := audio.Prepare(context.Background(), cfg)
+	if err != nil {
+		log.Fatalf("Setup failed: %v", err)
+	}
+	fmt.Printf("✔ Speech recognition ready (%s on %s, %s)\n", info.Model, info.Device, info.ComputeType)
+	fmt.Printf("✔ Setup complete. Data is stored in %s\n", env.DataDir)
 }
 
 func selectMode(scanner *bufio.Scanner) string {
 	fmt.Println("Select Mode:")
-	fmt.Println("1. CS2 In-Game Translate (Monitor Console Log)")
-	fmt.Println("2. Additionally listening to system output audio " +
-		"\nPress F9 to capture the last 15 seconds, transcribe, and translate.")
+	fmt.Println("1. CS2 In-Game Translate (console chat, optional live voice transcription)")
+	fmt.Println("2. Echo: chat translation + press F9 to transcribe and translate the last 15 seconds")
+	fmt.Println("   of voice (lightest option: speech recognition only runs when you press F9)")
 	fmt.Print("Enter choice [1]: ")
 
-	mode := "1"
-	if scanner.Scan() {
-		input := strings.TrimSpace(scanner.Text())
-		if input == "2" {
-			mode = "2"
-		}
+	if scanner.Scan() && strings.TrimSpace(scanner.Text()) == "2" {
+		return "2"
 	}
-	return mode
+	return "1"
 }
 
 func promptVoiceEnable(scanner *bufio.Scanner) bool {
-	fmt.Print("Enable Voice Transcription (uses Docker by default)? [y/N]: ")
+	fmt.Print("Enable live voice transcription (runs locally on the CPU)? [y/N]: ")
 	if scanner.Scan() {
-		input := strings.TrimSpace(scanner.Text())
-		if strings.ToLower(input) == "y" || strings.ToLower(input) == "yes" {
-			return true
-		}
+		input := strings.ToLower(strings.TrimSpace(scanner.Text()))
+		return input == "y" || input == "yes"
 	}
 	return false
-}
-
-func initAudioListener(useVoice bool) *audio.Listener {
-	if !useVoice {
-		return nil
-	}
-
-	tmpFile, err := os.CreateTemp("", "transcriber-*.py")
-	if err != nil {
-		log.Fatalf("Failed to create temp file for transcriber: %v", err)
-	}
-	defer os.Remove(tmpFile.Name())
-
-	if _, err := tmpFile.Write(transcriberScript); err != nil {
-		log.Fatalf("Failed to write transcriber script: %v", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		log.Fatalf("Failed to close temp transcriber file: %v", err)
-	}
-
-	log.Println("Initializing Audio Transcription Engine...")
-	audioListener, err := audio.NewListener(tmpFile.Name())
-	if err != nil {
-		log.Printf("Warning: Failed to create audio listener: %v", err)
-		return nil
-	}
-	return audioListener
 }
 
 type voiceContextItem struct {
@@ -92,137 +84,56 @@ type voiceContextItem struct {
 	timestamp time.Time
 }
 
-func parseTranscription(text string) (string, float64) {
-	transcribeDuration := 0.0
-	transcribedText := text
-	if idx := strings.LastIndex(text, "|"); idx != -1 {
-		if n, err := fmt.Sscanf(text[idx+1:], "%f", &transcribeDuration); err == nil && n == 1 {
-			transcribedText = text[:idx]
-		}
-	}
-	return transcribedText, transcribeDuration
+// voiceTranslator translates speech, using the last few seconds of speech as context.
+type voiceTranslator struct {
+	tr         *translator.OllamaTranslator
+	targetCode string
+	history    []voiceContextItem
 }
 
-func pruneOldContext(context []voiceContextItem, cutoff time.Time) []voiceContextItem {
-	for i, v := range context {
-		if v.timestamp.After(cutoff) {
-			return context[i:]
-		}
-	}
-	return context
+func newVoiceTranslator(tr *translator.OllamaTranslator) *voiceTranslator {
+	return &voiceTranslator{tr: tr, targetCode: translator.LanguageCode(tr.TargetLanguage())}
 }
 
-func buildContextString(context []voiceContextItem) string {
-	if len(context) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	for i, v := range context[:len(context)-1] {
-		if i > 0 {
-			sb.WriteString("\n")
-		}
-		sb.WriteString(v.text)
-	}
-	return sb.String()
-}
+const voiceContextWindow = 10 * time.Second
 
-func handleVoiceTranscription(ctx context.Context, tr *translator.OllamaTranslator, text string, voiceContext []voiceContextItem) (string, string, float64) {
-	transcribedText, transcribeDuration := parseTranscription(text)
-
+// translate returns the translation of t, or the original text if it is
+// already in the target language (no LLM call needed).
+func (v *voiceTranslator) translate(ctx context.Context, t audio.Transcript) (string, bool) {
 	now := time.Now()
-	voiceContext = append(voiceContext, voiceContextItem{text: transcribedText, timestamp: now})
+	contextText := v.contextText(now)
+	v.history = append(v.history, voiceContextItem{text: t.Text, timestamp: now})
 
-	cutoff := now.Add(-10 * time.Second)
-	voiceContext = pruneOldContext(voiceContext, cutoff)
-
-	contextText := buildContextString(voiceContext)
-
-	translateStart := time.Now()
-	var translated string
-	var err error
-	if len(contextText) > 0 {
-		translated, err = tr.TranslateWithContext(ctx, transcribedText, translator.VoiceContext{ContextText: contextText})
-	} else {
-		translated, err = tr.Translate(ctx, transcribedText)
+	if v.targetCode != "" && t.Language == v.targetCode && t.LanguageProbability >= 0.5 {
+		return t.Text, false
 	}
-	translateDuration := time.Since(translateStart)
-
+	translated, err := v.tr.TranslateWithContext(ctx, t.Text, translator.VoiceContext{ContextText: contextText})
 	if err != nil {
-		translated = transcribedText
+		return t.Text, false
 	}
-
-	return translated, fmt.Sprintf("voice %.2fs: ", translateDuration.Seconds()), transcribeDuration
+	return translated, true
 }
 
-func sliceAudioFile(inputPath, tmpDir string, listener *audio.Listener) {
-	go func() {
-		defer os.Remove(inputPath)
-
-		slicePath := filepath.Join(tmpDir, fmt.Sprintf("slice_%d.wav", time.Now().UnixNano()))
-
-		// log.Printf("Slicing audio: %s -> %s", inputPath, slicePath)
-
-		sliceCmd := exec.Command("ffmpeg", "-sseof", "-15", "-i", inputPath, "-c", "copy", "-y", slicePath)
-		if out, err := sliceCmd.CombinedOutput(); err != nil {
-			log.Printf("Quick slice failed, trying re-encode: %v", err)
-			sliceCmd = exec.Command("ffmpeg", "-sseof", "-15", "-i", inputPath, "-c:a", "pcm_s16le", "-y", slicePath)
-			if out2, err2 := sliceCmd.CombinedOutput(); err2 != nil {
-				log.Printf("Slice failed: %v\n%s\n%s", err2, string(out), string(out2))
-				return
-			}
-		}
-
-		absPath, _ := filepath.Abs(slicePath)
-		// log.Printf("Submitting file: %s", absPath)
-		listener.SubmitFile(absPath)
-	}()
+// contextText drops history older than the context window and joins the rest.
+func (v *voiceTranslator) contextText(now time.Time) string {
+	cutoff := now.Add(-voiceContextWindow)
+	i := 0
+	for i < len(v.history) && v.history[i].timestamp.Before(cutoff) {
+		i++
+	}
+	v.history = v.history[i:]
+	parts := make([]string, len(v.history))
+	for j, item := range v.history {
+		parts[j] = item.text
+	}
+	return strings.Join(parts, "\n")
 }
 
-func stopRecordingGracefully(cmd *exec.Cmd, stdin io.WriteCloser) {
-	if cmd == nil || cmd.Process == nil {
-		return
+func (v *voiceTranslator) print(ctx context.Context, t audio.Transcript) {
+	fmt.Printf("\nVoice [%s, %.1fs audio, recognised in %.2fs]: %s\n", t.Language, t.AudioSeconds, t.ProcessingSeconds, t.Text)
+	start := time.Now()
+	translated, didTranslate := v.translate(ctx, t)
+	if didTranslate {
+		fmt.Printf("\033[1;32mTranslated (%.2fs): %s\033[0m\n", time.Since(start).Seconds(), translated)
 	}
-
-	if stdin != nil {
-		if _, err := stdin.Write([]byte("q")); err != nil {
-			// Write failed, process might be dead or stuck, try signal
-			if runtime.GOOS == "windows" {
-				cmd.Process.Kill()
-			} else {
-				cmd.Process.Signal(syscall.SIGTERM)
-			}
-		}
-		stdin.Close()
-	} else {
-		if runtime.GOOS == "windows" {
-			cmd.Process.Kill()
-		} else {
-			cmd.Process.Signal(syscall.SIGTERM)
-		}
-	}
-
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case <-done:
-	case <-time.After(500 * time.Millisecond):
-		log.Println("Warning: ffmpeg process did not exit in time, killing...")
-		cmd.Process.Kill()
-		// Don't block forever if it's truly stuck, though this leaks a goroutine
-		select {
-		case <-done:
-		case <-time.After(1 * time.Second):
-			log.Println("Error: ffmpeg process stuck even after Kill")
-		}
-	}
-}
-
-func renameWithRetry(from, to string) error {
-	for i := 0; i < 10; i++ {
-		if err := os.Rename(from, to); err == nil {
-			return nil
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return os.Rename(from, to)
 }
