@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/micha/cs-ingame-translate/ui"
 )
 
 // AssumeYes answers every setup question with its default ("yes"), for
@@ -57,8 +59,13 @@ func runVisible(name string, args ...string) error {
 	return cmd.Run()
 }
 
-// downloadFile fetches url into dest.
-func downloadFile(url, dest string) error {
+// downloadFile fetches url into dest. A non-empty label shows a progress bar.
+func downloadFile(url, dest, label string) error {
+	var st *ui.Status
+	if label != "" {
+		st = ui.Start(label)
+		defer st.Stop()
+	}
 	client := &http.Client{Timeout: 10 * time.Minute}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -72,11 +79,33 @@ func downloadFile(url, dest string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, resp.Body); err != nil {
+	var w io.Writer = out
+	if st != nil {
+		w = &progressWriter{w: out, st: st, total: resp.ContentLength}
+	}
+	if _, err := io.Copy(w, resp.Body); err != nil {
 		out.Close()
 		return err
 	}
 	return out.Close()
+}
+
+// progressWriter updates a progress bar as data is written.
+type progressWriter struct {
+	w           io.Writer
+	st          *ui.Status
+	done, total int64
+	last        time.Time
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n, err := p.w.Write(b)
+	p.done += int64(n)
+	if now := time.Now(); now.Sub(p.last) >= 100*time.Millisecond || p.done == p.total {
+		p.last = now
+		p.st.Progress(p.done, p.total, "B")
+	}
+	return n, err
 }
 
 func exeName(name string) string {

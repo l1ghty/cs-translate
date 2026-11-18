@@ -81,7 +81,9 @@ The game always gets priority:
 - **Fast settings:** int8 quantization, greedy decoding, and no temperature fallback. If recognition ever falls behind, old speech is dropped instead of building up a backlog.
 - **Nothing touches the disk.** Audio stays in a small in-memory buffer (about 2 MB). There are no temp files and no external processes per clip.
 - **Same-language speech is not translated.** If someone already speaks your target language, the translation step is skipped.
-- **The translation model stays loaded for 30 minutes**, so it is not reloaded in the middle of a match, and it is unloaded when you exit.
+- **Both models are loaded and warmed up at startup**, in parallel, so pressing F9 (or a new chat line) is handled immediately instead of waiting for a model to load. Startup shows what is happening, with progress bars for downloads.
+- **The translation model stays loaded while the tool runs**, so it is not reloaded in the middle of a match. It is unloaded when you exit (and after 30 minutes if the tool is killed).
+- **F9 never waits.** Transcription and translation run in the background, with a status line showing what is in progress.
 
 `-whisper-model auto` picks settings based on your CPU:
 

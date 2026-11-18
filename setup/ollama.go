@@ -16,15 +16,18 @@ import (
 	"time"
 
 	"github.com/micha/cs-ingame-translate/translator"
+	"github.com/micha/cs-ingame-translate/ui"
 )
 
 // SetupOllama makes sure a native Ollama server is reachable and the
 // translation model is available, installing Ollama if needed.
 func SetupOllama(scanner *bufio.Scanner, model string) error {
-	fmt.Println("Checking Ollama (translation engine)...")
 	base := translator.OllamaHost
+	st := ui.Start("Checking Ollama (translation engine)")
+	_, err := ollamaVersion(base)
+	st.Stop()
 
-	if _, err := ollamaVersion(base); err != nil {
+	if err != nil {
 		bin := findOllama()
 		if bin == "" {
 			fmt.Println("Ollama is not installed. It runs the local translation model.")
@@ -101,8 +104,7 @@ func installOllama(scanner *bufio.Scanner) error {
 	switch runtime.GOOS {
 	case "windows":
 		tmp := filepath.Join(os.TempDir(), "OllamaSetup.exe")
-		fmt.Println("Downloading the Ollama installer...")
-		if err := downloadFile("https://ollama.com/download/OllamaSetup.exe", tmp); err != nil {
+		if err := downloadFile("https://ollama.com/download/OllamaSetup.exe", tmp, "Downloading the Ollama installer"); err != nil {
 			return fmt.Errorf("download failed (%v); install Ollama from https://ollama.com/download", err)
 		}
 		defer os.Remove(tmp)
@@ -125,7 +127,7 @@ func installOllama(scanner *bufio.Scanner) error {
 		}
 	default:
 		tmp := filepath.Join(os.TempDir(), "ollama-install.sh")
-		if err := downloadFile("https://ollama.com/install.sh", tmp); err != nil {
+		if err := downloadFile("https://ollama.com/install.sh", tmp, "Downloading the Ollama install script"); err != nil {
 			return fmt.Errorf("download failed (%v); see https://ollama.com/download/linux", err)
 		}
 		defer os.Remove(tmp)
@@ -143,7 +145,8 @@ func startOllama(bin, base string) error {
 	if u, err := url.Parse(base); err == nil && portInUse(u.Host) {
 		return fmt.Errorf("port %s is used by another program and Ollama does not answer there; set OLLAMA_HOST to a free address", u.Port())
 	}
-	fmt.Println("Starting Ollama...")
+	st := ui.Start("Starting Ollama")
+	defer st.Stop()
 	cmd := exec.Command(bin, "serve")
 	cmd.Env = append(os.Environ(),
 		"OLLAMA_HOST="+strings.TrimPrefix(strings.TrimPrefix(base, "http://"), "https://"),
@@ -160,11 +163,11 @@ func startOllama(bin, base string) error {
 		return fmt.Errorf("could not start ollama: %w", err)
 	}
 	go cmd.Wait()
-	for i := 0; i < 30; i++ {
+	for i := 0; i < 60; i++ {
 		if _, err := ollamaVersion(base); err == nil {
 			return nil
 		}
-		time.Sleep(time.Second)
+		time.Sleep(500 * time.Millisecond)
 	}
 	return fmt.Errorf("ollama did not start within 30s")
 }
@@ -189,6 +192,8 @@ func ensureModel(scanner *bufio.Scanner, base, model string) error {
 	if !askYesNo(scanner, "Download it now? (one-time, ~1-2 GB)") {
 		return fmt.Errorf("model '%s' is required for translation", model)
 	}
+	st := ui.Start("Downloading translation model")
+	defer st.Stop()
 	body, _ := json.Marshal(map[string]any{"model": model, "stream": true})
 	resp, err := http.Post(base+"/api/pull", "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -197,7 +202,6 @@ func ensureModel(scanner *bufio.Scanner, base, model string) error {
 	defer resp.Body.Close()
 
 	dec := json.NewDecoder(resp.Body)
-	lastStatus := ""
 	for {
 		var p struct {
 			Status    string `json:"status"`
@@ -209,17 +213,13 @@ func ensureModel(scanner *bufio.Scanner, base, model string) error {
 			break
 		}
 		if p.Error != "" {
-			fmt.Println()
 			return fmt.Errorf("pulling model: %s", p.Error)
 		}
-		if p.Total > 0 {
-			fmt.Printf("\r  %s: %5.1f%% of %d MB   ", p.Status, float64(p.Completed)*100/float64(p.Total), p.Total>>20)
-		} else if p.Status != lastStatus {
-			fmt.Printf("\n  %s", p.Status)
-		}
-		lastStatus = p.Status
+		st.Set("Translation model: " + p.Status)
+		st.Progress(p.Completed, p.Total, "B")
 	}
-	fmt.Println()
+	st.Set("Checking translation model")
+	st.Progress(0, 0, "")
 	if !hasModel(base, model) {
 		return fmt.Errorf("model '%s' could not be downloaded", model)
 	}

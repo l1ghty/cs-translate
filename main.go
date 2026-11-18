@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/micha/cs-ingame-translate/parser"
 	"github.com/micha/cs-ingame-translate/setup"
 	"github.com/micha/cs-ingame-translate/translator"
+	"github.com/micha/cs-ingame-translate/ui"
 	"github.com/nxadm/tail"
 )
 
@@ -40,6 +43,7 @@ func main() {
 	assumeYes := flag.Bool("yes", false, "Answer 'yes' to all setup questions (unattended install)")
 	flag.Parse()
 	setup.AssumeYes = *assumeYes
+	log.SetOutput(ui.Writer()) // log lines must not break the status line
 
 	scanner := bufio.NewScanner(os.Stdin)
 	speechCfg := audio.Config{
@@ -85,57 +89,98 @@ func main() {
 		log.Fatalf("Error creating translator: %v", err)
 	}
 	defer tr.Close()
-	fmt.Printf("Using Ollama model '%s' for translation to %s\n", *ollamaModel, *targetLang)
+	fmt.Printf("Translating to %s with Ollama model '%s'\n", *targetLang, *ollamaModel)
 
-	var worker *audio.Worker
 	if *useVoice {
 		speechCfg.UV = env.UV
 		speechCfg.DataDir = env.DataDir
 		speechCfg.Live = !isEchoMode // echo mode only transcribes on F9: zero load while idle
-		worker, err = startSpeech(ctx, speechCfg)
-		if err != nil {
-			if isEchoMode || ctx.Err() != nil {
-				log.Fatalf("Voice transcription unavailable: %v", err)
-			}
-			log.Printf("Warning: voice transcription disabled: %v", err)
-		} else {
-			defer worker.Close()
+	}
+	worker, err := loadModels(ctx, tr, *ollamaModel, *useVoice, speechCfg)
+	if ctx.Err() != nil {
+		return
+	}
+	if err != nil {
+		if isEchoMode {
+			log.Fatalf("Voice transcription unavailable: %v", err)
 		}
+		log.Printf("Warning: voice transcription disabled: %v", err)
 	}
+	if worker != nil {
+		defer worker.Close()
+	}
+	go tr.KeepWarm(ctx) // stay loaded so translations are instant even after quiet periods
 
+	s := newSession(ctx, tr, worker)
 	if isEchoMode {
-		runEchoMode(ctx, scanner, tr, worker, *logPath)
+		runEchoMode(ctx, scanner, s, *logPath)
 	} else {
-		runCS2Mode(ctx, scanner, tr, worker, *logPath)
+		runCS2Mode(ctx, scanner, s, *logPath)
 	}
+	s.busy.stop()
 	fmt.Println("\nStopping...")
 }
 
-func startSpeech(ctx context.Context, cfg audio.Config) (*audio.Worker, error) {
-	cfg = cfg.Resolve()
-	fmt.Printf("Starting speech recognition (Whisper '%s' on %s, %d thread(s))...\n", cfg.Model, cfg.Device, cfg.Threads)
-	fmt.Println("The first start installs the speech engine and downloads the model; this takes a few minutes once.")
-	w, err := audio.Start(ctx, cfg)
-	if err != nil {
-		return nil, err
+// loadModels loads the translation model and (if voice is on) the speech
+// model in parallel and warms both up, so the first F9 / chat line / voice
+// line is handled right away instead of waiting for models to load.
+func loadModels(ctx context.Context, tr *translator.OllamaTranslator, model string, voice bool, cfg audio.Config) (*audio.Worker, error) {
+	st := ui.Start("")
+	defer st.Stop()
+
+	trTask := st.Task("Translation model")
+	trTask.Set("loading into memory")
+	trDone := make(chan struct{})
+	go func() {
+		defer close(trDone)
+		start := time.Now()
+		if err := tr.Preload(ctx); err != nil {
+			if ctx.Err() != nil {
+				trTask.Done("")
+				return
+			}
+			trTask.Done(fmt.Sprintf("⚠ Could not preload the translation model (%v); it will load on first use.", err))
+			return
+		}
+		trTask.Done(fmt.Sprintf("✔ Translation model '%s' loaded (%s)", model, seconds(time.Since(start))))
+	}()
+
+	var worker *audio.Worker
+	var err error
+	if voice {
+		cfg = cfg.Resolve()
+		spTask := st.Task("Speech model")
+		cfg.Progress = func(p audio.Progress) {
+			spTask.Set(p.Message)
+			spTask.Progress(p.Done, p.Total, p.Unit)
+		}
+		start := time.Now()
+		worker, err = audio.Start(ctx, cfg)
+		if err == nil {
+			i := worker.Info
+			spTask.Done(fmt.Sprintf("✔ Speech recognition ready: Whisper '%s' on %s (%s, %d thread(s)), loaded in %s\n  Listening to: %s",
+				i.Model, i.Device, i.ComputeType, i.Threads, seconds(time.Since(start)), i.AudioDevice))
+		} else {
+			spTask.Done("")
+		}
 	}
-	fmt.Printf("✔ Speech recognition ready: %s (%s, %s), listening to: %s\n",
-		w.Info.Model, w.Info.Device, w.Info.ComputeType, w.Info.AudioDevice)
-	return w, nil
+	<-trDone
+	return worker, err
 }
+
+func seconds(d time.Duration) string { return fmt.Sprintf("%.1fs", d.Seconds()) }
 
 // openLogMonitor tails the CS2 console log. If wait is true it keeps looking
 // until CS2 has created the file.
 func openLogMonitor(ctx context.Context, logPath string, wait bool) *monitor.Monitor {
 	path := logPath
 	if path == "" {
-		fmt.Println("Auto-detecting CS2 console log...")
-		waiting := false
+		var st *ui.Status
 		for {
 			p, err := findLogFile()
 			if err == nil {
-				if waiting {
-					fmt.Println()
+				if st != nil {
+					st.Stop()
 				}
 				path = p
 				break
@@ -144,13 +189,12 @@ func openLogMonitor(ctx context.Context, logPath string, wait bool) *monitor.Mon
 				fmt.Println("Warning: CS2 console.log not found, chat translation disabled (use -log to set it).")
 				return nil
 			}
-			if !waiting {
-				fmt.Println("Log file not found yet. Waiting for CS2 to start...")
-				waiting = true
+			if st == nil {
+				st = ui.Start("Waiting for CS2 to start (console.log not found yet)")
 			}
-			fmt.Print(".")
 			select {
 			case <-ctx.Done():
+				st.Stop()
 				return nil
 			case <-time.After(2 * time.Second):
 			}
@@ -165,23 +209,7 @@ func openLogMonitor(ctx context.Context, logPath string, wait bool) *monitor.Mon
 	return mon
 }
 
-func handleChatLine(ctx context.Context, tr *translator.OllamaTranslator, line *tail.Line) {
-	if line.Err != nil {
-		return
-	}
-	msg := parser.ParseLine(line.Text)
-	if msg == nil {
-		return
-	}
-	translated, err := tr.Translate(ctx, msg.MessageContent)
-	if err != nil {
-		log.Printf("Translation error: %v", err)
-		translated = "[Translation Pending/Error]"
-	}
-	outputChat(msg.PlayerName, translated, msg.IsDead, msg.OriginalText)
-}
-
-func runEchoMode(ctx context.Context, scanner *bufio.Scanner, tr *translator.OllamaTranslator, worker *audio.Worker, logPath string) {
+func runEchoMode(ctx context.Context, scanner *bufio.Scanner, s *session, logPath string) {
 	fmt.Println("\n=== Echo Mode Started ===")
 	fmt.Println("Listening to system audio + monitoring the CS2 console.")
 	fmt.Printf("Press F9 (or Enter in this window) to transcribe and translate the last %d seconds.\n", captureSeconds)
@@ -212,45 +240,35 @@ func runEchoMode(ctx context.Context, scanner *bufio.Scanner, tr *translator.Oll
 		}
 	}()
 
-	vt := newVoiceTranslator(tr)
-	capture := func(trigger string) {
-		fmt.Printf("\n[%s] Transcribing the last %d seconds...\n", trigger, captureSeconds)
-		if err := worker.Capture(captureSeconds); err != nil {
-			log.Printf("Capture failed: %v", err)
-		}
-	}
-
+	// This loop never waits for transcription or translation (they run in
+	// the background), so F9 is always handled the moment it is pressed.
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case err := <-hkErr:
-			fmt.Printf("Global F9 hotkey unavailable (%v).\nPress Enter in this window to capture instead.\n", err)
+			ui.Printf("Global F9 hotkey unavailable (%v).\nPress Enter in this window to capture instead.\n", err)
 		case line, ok := <-logLines:
 			if !ok {
 				logLines = nil
 				continue
 			}
-			handleChatLine(ctx, tr, line)
+			s.chatLine(line)
 		case <-hk.KeyPressed():
-			capture("F9")
+			s.capture("F9")
 		case <-enter:
-			capture("Enter")
-		case t, ok := <-worker.Transcripts():
+			s.capture("Enter")
+		case t, ok := <-s.worker.Transcripts():
 			if !ok {
 				log.Println("Speech worker stopped unexpectedly.")
 				return
 			}
-			if t.Empty {
-				fmt.Println("No speech found in that audio.")
-				continue
-			}
-			vt.print(ctx, t)
+			s.transcript(t)
 		}
 	}
 }
 
-func runCS2Mode(ctx context.Context, scanner *bufio.Scanner, tr *translator.OllamaTranslator, worker *audio.Worker, logPath string) {
+func runCS2Mode(ctx context.Context, scanner *bufio.Scanner, s *session, logPath string) {
 	if err := checkCondebug(scanner); err != nil {
 		fmt.Printf("Warning: Could not verify launch options: %v\n", err)
 	}
@@ -263,10 +281,9 @@ func runCS2Mode(ctx context.Context, scanner *bufio.Scanner, tr *translator.Olla
 	logLines := mon.Lines()
 
 	var transcripts <-chan audio.Transcript
-	if worker != nil {
-		transcripts = worker.Transcripts()
+	if s.worker != nil {
+		transcripts = s.worker.Transcripts()
 	}
-	vt := newVoiceTranslator(tr)
 
 	fmt.Println("Waiting for chat messages...")
 	for {
@@ -277,25 +294,181 @@ func runCS2Mode(ctx context.Context, scanner *bufio.Scanner, tr *translator.Olla
 			if !ok {
 				return
 			}
-			handleChatLine(ctx, tr, line)
+			s.chatLine(line)
 		case t, ok := <-transcripts:
 			if !ok {
 				log.Println("Speech worker stopped; continuing with chat translation only.")
 				transcripts = nil
 				continue
 			}
-			vt.print(ctx, t)
+			s.transcript(t)
 		}
 	}
 }
 
+// session handles chat lines, F9 captures and transcripts. Translations run
+// one at a time in a background goroutine so the event loop never blocks.
+type session struct {
+	ctx    context.Context
+	tr     *translator.OllamaTranslator
+	worker *audio.Worker
+	vt     *voiceTranslator
+	busy   *busy
+	jobs   chan func()
+}
+
+func newSession(ctx context.Context, tr *translator.OllamaTranslator, worker *audio.Worker) *session {
+	s := &session{
+		ctx:    ctx,
+		tr:     tr,
+		worker: worker,
+		vt:     newVoiceTranslator(tr),
+		busy:   &busy{},
+		jobs:   make(chan func(), 64),
+	}
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case job := <-s.jobs:
+				job()
+				s.busy.update(func(b *busy) { b.translating-- })
+			}
+		}
+	}()
+	return s
+}
+
+func (s *session) translate(job func()) {
+	s.busy.update(func(b *busy) { b.translating++ })
+	select {
+	case s.jobs <- job:
+	case <-s.ctx.Done():
+	}
+}
+
+func (s *session) chatLine(line *tail.Line) {
+	if line.Err != nil {
+		return
+	}
+	msg := parser.ParseLine(line.Text)
+	if msg == nil {
+		return
+	}
+	s.translate(func() {
+		translated, err := s.tr.Translate(s.ctx, msg.MessageContent)
+		if err != nil {
+			if s.ctx.Err() != nil {
+				return
+			}
+			log.Printf("Translation error: %v", err)
+			translated = "[Translation Pending/Error]"
+		}
+		outputChat(msg.PlayerName, translated, msg.IsDead, msg.OriginalText)
+	})
+}
+
+func (s *session) capture(trigger string) {
+	if err := s.worker.Capture(captureSeconds); err != nil {
+		log.Printf("Capture failed: %v", err)
+		return
+	}
+	ui.Printf("\n[%s] Captured the last %d seconds of audio\n", trigger, captureSeconds)
+	s.busy.update(func(b *busy) { b.captures++ })
+}
+
+func (s *session) transcript(t audio.Transcript) {
+	switch t.Kind {
+	case audio.KindStart:
+		s.busy.update(func(b *busy) {
+			if t.Source == "capture" {
+				b.clips = t.Pieces
+			} else {
+				b.live++
+			}
+		})
+	case audio.KindDone:
+		s.busy.update(func(b *busy) {
+			if t.Source == "capture" {
+				b.captures = max(b.captures-1, 0)
+				b.clips = 0
+			} else {
+				b.live = max(b.live-1, 0)
+			}
+		})
+		if t.Source == "capture" && !t.Found {
+			ui.Println("No speech found in that audio.")
+		}
+	case audio.KindText:
+		s.vt.printOriginal(t)
+		s.translate(func() { s.vt.printTranslation(s.ctx, t) })
+	}
+}
+
+// busy shows what is running in the background on the status line.
+type busy struct {
+	mu          sync.Mutex
+	st          *ui.Status
+	captures    int // F9 captures waiting for or in transcription
+	clips       int // utterances in the capture being transcribed
+	live        int // live utterances being transcribed
+	translating int // translations queued or running
+}
+
+func (b *busy) update(f func(*busy)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	f(b)
+	var parts []string
+	if b.captures > 0 {
+		p := fmt.Sprintf("Transcribing the last %ds of voice", captureSeconds)
+		if b.clips > 1 {
+			p += fmt.Sprintf(" (%d clips)", b.clips)
+		}
+		if b.captures > 1 {
+			p += fmt.Sprintf(", %d more queued", b.captures-1)
+		}
+		parts = append(parts, p)
+	}
+	if b.live > 0 {
+		parts = append(parts, "Transcribing voice")
+	}
+	if b.translating > 0 {
+		p := "Translating"
+		if b.translating > 1 {
+			p += fmt.Sprintf(" (%d queued)", b.translating-1)
+		}
+		parts = append(parts, p)
+	}
+	if len(parts) == 0 {
+		if b.st != nil {
+			b.st.Stop()
+			b.st = nil
+		}
+		return
+	}
+	label := strings.Join(parts, " · ")
+	if b.st == nil {
+		b.st = ui.Start(label)
+	} else {
+		b.st.Set(label)
+	}
+}
+
+func (b *busy) stop() {
+	b.update(func(b *busy) { b.captures, b.clips, b.live, b.translating = 0, 0, 0, 0 })
+}
+
 func outputChat(name, text string, isDead bool, originalLine string) {
+	var sb strings.Builder
 	if originalLine != "" {
-		fmt.Println(originalLine)
+		sb.WriteString(originalLine + "\n")
 	}
 	prefix := ""
 	if isDead {
 		prefix = "*DEAD* "
 	}
-	fmt.Printf("\033[1;32m%s%s : %s\033[0m\n", prefix, name, text)
+	fmt.Fprintf(&sb, "\033[1;32m%s%s : %s\033[0m\n", prefix, name, text)
+	ui.Printf("%s", sb.String())
 }

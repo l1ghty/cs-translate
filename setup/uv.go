@@ -63,7 +63,7 @@ func EnsureUV() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	fmt.Printf("Downloading uv (Python runtime manager, ~20 MB) to %s ...\n", filepath.Dir(local))
+	fmt.Printf("Installing uv (Python runtime manager, ~20 MB) to %s\n", filepath.Dir(local))
 	if err := installUV(uvReleaseURL, asset, local); err != nil {
 		return "", fmt.Errorf("could not install uv: %w\nInstall it manually from https://docs.astral.sh/uv/getting-started/installation/ and run again", err)
 	}
@@ -79,11 +79,11 @@ func installUV(baseURL, asset, dest string) error {
 	defer os.RemoveAll(tmpDir)
 
 	archive := filepath.Join(tmpDir, asset)
-	if err := downloadFile(baseURL+asset, archive); err != nil {
+	if err := downloadFile(baseURL+asset, archive, "Downloading uv"); err != nil {
 		return err
 	}
 	sumFile := archive + ".sha256"
-	if err := downloadFile(baseURL+asset+".sha256", sumFile); err != nil {
+	if err := downloadFile(baseURL+asset+".sha256", sumFile, ""); err != nil {
 		return fmt.Errorf("downloading checksum: %w", err)
 	}
 	if err := verifySHA256(archive, sumFile); err != nil {
