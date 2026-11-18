@@ -50,7 +50,7 @@ cs-translate.exe -lang Spanish      # Windows
 You then choose a mode:
 
 1. **In-game translate:** translates console chat. You can also turn on **live** voice transcription, which transcribes everything that is said.
-2. **Echo:** translates chat, and when you press **F9** (or **Enter**) it transcribes and translates the **last 15 seconds** of audio. This is the lightest option, because speech recognition does nothing until you press the key.
+2. **Echo:** translates chat, and when you press **F9** (or **Enter**) it transcribes and translates the **last 15 seconds** of audio. Each utterance in that window is recognized separately, so mixed languages work. This is the lightest option, because speech recognition does nothing until you press the key.
 
 CS2 must be started with the `-condebug` launch option so that it writes `console.log`. The tool checks for this and offers to open the Steam settings for you. The log file is found automatically in every Steam library, including libraries on other drives and Flatpak Steam.
 
@@ -60,7 +60,7 @@ CS2 must be started with the `-condebug` launch option so that it writes `consol
 |------|-------------|---------|
 | `-lang` | Target language for translation | `English` |
 | `-voice` | Enable live voice transcription without asking | off |
-| `-voice-lang` | Language spoken in voice chat, such as `ru` or `de`. Skips language detection, which makes recognition faster and more accurate. | auto-detect |
+| `-voice-lang` | Language spoken in voice chat. One code (`ru`) skips detection entirely. A list (`ru,en,de`) keeps detection within those languages, which avoids misdetected short clips. | auto-detect |
 | `-whisper-model` | `auto`, `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, or `distil-large-v3.5` (English only) | `auto` |
 | `-whisper-device` | `cpu`, or `cuda` for an NVIDIA GPU (see [Performance](#performance)) | `cpu` |
 | `-whisper-threads` | CPU threads for speech recognition (`0` means auto) | `0` |

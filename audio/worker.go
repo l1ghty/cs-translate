@@ -42,7 +42,7 @@ type Config struct {
 	Model       string // Whisper model name ("auto" picks one for this PC)
 	Device      string // "cpu" (default, keeps the GPU free for the game) or "cuda"
 	Threads     int    // CPU threads for Whisper; 0 = auto
-	Language    string // spoken language hint (ISO code) or "" for auto-detect
+	Language    string // spoken language (ISO code), comma-separated candidates, or "" for auto-detect
 	AudioDevice string // capture device name/substring; "" = what you hear (loopback)
 	Live        bool   // continuously transcribe speech; otherwise only on Capture()
 	BufferSecs  int    // seconds of audio kept in memory for Capture()
@@ -194,6 +194,7 @@ func (c Config) command(ctx context.Context, extra ...string) (*exec.Cmd, error)
 		"PYTHONIOENCODING=utf-8",
 		"HF_HUB_DISABLE_TELEMETRY=1",
 		"HF_HUB_DISABLE_SYMLINKS_WARNING=1",
+		"HF_HUB_VERBOSITY=error",
 	)
 	cmd.Stderr = os.Stderr // install progress, model download and worker logs
 	return cmd, nil

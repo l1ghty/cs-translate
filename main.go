@@ -34,7 +34,7 @@ func main() {
 	whisperModel := flag.String("whisper-model", "auto", "Speech model: auto, tiny, base, small, medium, large-v3-turbo, distil-large-v3.5 (English only)")
 	whisperDevice := flag.String("whisper-device", "cpu", "Run speech recognition on 'cpu' (recommended while gaming) or 'cuda' (NVIDIA GPU)")
 	whisperThreads := flag.Int("whisper-threads", 0, "CPU threads for speech recognition (0 = auto, leaves most cores to the game)")
-	voiceLang := flag.String("voice-lang", "", "Language spoken in voice chat, e.g. ru or de (default: auto-detect)")
+	voiceLang := flag.String("voice-lang", "", "Language(s) spoken in voice chat: one code (ru) or a list (ru,en,de) to keep detection within them (default: auto-detect)")
 	translateCPU := flag.Bool("translate-cpu", false, "Run the translation model on the CPU only, keeping the GPU free for the game")
 	setupOnly := flag.Bool("setup", false, "Install and download everything needed, then exit")
 	assumeYes := flag.Bool("yes", false, "Answer 'yes' to all setup questions (unattended install)")
@@ -175,6 +175,7 @@ func handleChatLine(ctx context.Context, tr *translator.OllamaTranslator, line *
 	}
 	translated, err := tr.Translate(ctx, msg.MessageContent)
 	if err != nil {
+		log.Printf("Translation error: %v", err)
 		translated = "[Translation Pending/Error]"
 	}
 	outputChat(msg.PlayerName, translated, msg.IsDead, msg.OriginalText)

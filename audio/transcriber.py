@@ -350,49 +350,73 @@ def load_model(args):
     return model, "cpu", compute
 
 
-def transcribe(model, args, audio, source):
-    t0 = time.perf_counter()
-    segments, info = model.transcribe(
+def _decode(model, audio, language):
+    return model.transcribe(
         audio,
-        language=args.language or None,
+        language=language,
         task="transcribe",
         beam_size=1,               # greedy decoding: much cheaper, small quality cost
         best_of=1,
         temperature=0.0,           # no temperature fallback re-decoding
         condition_on_previous_text=False,
         without_timestamps=True,
-        vad_filter=(source == "capture"),  # live audio is already VAD-segmented
+        vad_filter=False,          # audio is already VAD-segmented
         no_speech_threshold=0.6,
         log_prob_threshold=-1.0,
         compression_ratio_threshold=2.4,
     )
+
+
+def transcribe(model, languages, audio):
+    """Transcribe one utterance. `languages` is [] (auto), [code] (fixed) or a
+    list of candidates: auto-detection is then kept within those languages."""
+    t0 = time.perf_counter()
+    segments, info = _decode(model, audio, languages[0] if len(languages) == 1 else None)
+    language, probability = info.language, info.language_probability
+    if len(languages) > 1 and language not in languages:
+        # Short clips are often mis-detected; fall back to the most likely
+        # allowed language. Costs a second decode only in this case.
+        probs = dict(info.all_language_probs or [])
+        language = max(languages, key=lambda code: probs.get(code, 0.0))
+        probability = probs.get(language, 0.0)
+        segments, _ = _decode(model, audio, language)
     parts = []
     for seg in segments:
         text = seg.text.strip()
         if text and text.lower() not in HALLUCINATIONS:
             parts.append(text)
-    text = " ".join(parts).strip()
-    return text, info, time.perf_counter() - t0
+    return " ".join(parts).strip(), language, probability, time.perf_counter() - t0
+
+
+def split_speech(audio):
+    """Split captured audio into utterances so each gets its own language detection."""
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    chunks = get_speech_timestamps(audio, VadOptions(min_silence_duration_ms=600, speech_pad_ms=200))
+    return [audio[c["start"]:c["end"]] for c in chunks if c["end"] - c["start"] >= SAMPLE_RATE // 4]
 
 
 def asr_loop(model, args, jobs):
+    languages = [l.strip().lower() for l in args.language.split(",") if l.strip()]
     while True:
         source, audio = jobs.get()
         if source == "quit":
             return
         try:
-            if len(audio) < SAMPLE_RATE // 4:
-                if source == "capture":
-                    emit("empty", source=source)
-                continue
-            text, info, took = transcribe(model, args, audio, source)
-            if not text:
-                if source == "capture":
-                    emit("empty", source=source)
-                continue
-            emit("transcript", source=source, text=text,
-                 language=info.language, language_probability=round(info.language_probability, 3),
-                 audio_seconds=round(len(audio) / SAMPLE_RATE, 2), processing_seconds=round(took, 2))
+            pieces = split_speech(audio) if source == "capture" else [audio]
+            found = False
+            for piece in pieces:
+                if len(piece) < SAMPLE_RATE // 4:
+                    continue
+                text, language, probability, took = transcribe(model, languages, piece)
+                if not text:
+                    continue
+                found = True
+                emit("transcript", source=source, text=text,
+                     language=language, language_probability=round(probability, 3),
+                     audio_seconds=round(len(piece) / SAMPLE_RATE, 2), processing_seconds=round(took, 2))
+            if not found and source == "capture":
+                emit("empty", source=source)
         except Exception as e:
             emit("error", message=f"transcription failed: {e}", fatal=False)
 
