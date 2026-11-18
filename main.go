@@ -3,17 +3,12 @@ package main
 import (
 	"bufio"
 	"context"
-	_ "embed"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"runtime"
-	"strings"
 	"syscall"
 	"time"
 
@@ -21,375 +16,278 @@ import (
 	"github.com/micha/cs-ingame-translate/hotkey"
 	"github.com/micha/cs-ingame-translate/monitor"
 	"github.com/micha/cs-ingame-translate/parser"
+	"github.com/micha/cs-ingame-translate/setup"
 	"github.com/micha/cs-ingame-translate/translator"
 	"github.com/nxadm/tail"
 )
 
-//go:embed transcriber.py
-var transcriberScript []byte
+// captureSeconds is how much recent audio F9 transcribes in echo mode.
+const captureSeconds = 15
 
 func main() {
-	logPath := flag.String("log", "", "Path to the CS2 console log file")
+	logPath := flag.String("log", "", "Path to the CS2 console log file (default: auto-detect)")
 	ollamaModel := flag.String("model", translator.DefaultOllamaModel, "Ollama model to use for translation")
 	targetLang := flag.String("lang", "English", "Target language for translation")
-	audioDevice := flag.String("audiodevice", "", "Audio device to monitor (default: auto-detect)")
+	useVoice := flag.Bool("voice", false, "Enable live voice transcription")
+	audioDevice := flag.String("audiodevice", "", "Audio device to capture (default: what you hear, i.e. the default output)")
 	listDevices := flag.Bool("list-audio-devices", false, "List available audio devices and exit")
-	useVoice := flag.Bool("voice", false, "Enable voice transcription (local Whisper)")
-
+	whisperModel := flag.String("whisper-model", "auto", "Speech model: auto, tiny, base, small, medium, large-v3-turbo, distil-large-v3.5 (English only)")
+	whisperDevice := flag.String("whisper-device", "cpu", "Run speech recognition on 'cpu' (recommended while gaming) or 'cuda' (NVIDIA GPU)")
+	whisperThreads := flag.Int("whisper-threads", 0, "CPU threads for speech recognition (0 = auto, leaves most cores to the game)")
+	voiceLang := flag.String("voice-lang", "", "Language(s) spoken in voice chat: one code (ru) or a list (ru,en,de) to keep detection within them (default: auto-detect)")
+	translateCPU := flag.Bool("translate-cpu", false, "Run the translation model on the CPU only, keeping the GPU free for the game")
+	setupOnly := flag.Bool("setup", false, "Install and download everything needed, then exit")
+	assumeYes := flag.Bool("yes", false, "Answer 'yes' to all setup questions (unattended install)")
 	flag.Parse()
-
-	// List audio devices if requested
-	if *listDevices {
-		listAudioDevices()
-	}
+	setup.AssumeYes = *assumeYes
 
 	scanner := bufio.NewScanner(os.Stdin)
+	speechCfg := audio.Config{
+		Model:       *whisperModel,
+		Device:      *whisperDevice,
+		Threads:     *whisperThreads,
+		Language:    *voiceLang,
+		AudioDevice: *audioDevice,
+		BufferSecs:  captureSeconds * 2,
+	}
 
-	mode := selectMode(scanner)
-	isEchoMode := mode == "2"
+	if *listDevices {
+		listAudioDevices(speechCfg)
+		return
+	}
+	if *setupOnly {
+		runSetup(scanner, *ollamaModel, speechCfg)
+		return
+	}
 
-	var preRecCmd *exec.Cmd
-	var preRecStdin io.WriteCloser
-	var preRecDir string
-	var preRecPath string
-
-	// Voice setup logic
+	isEchoMode := selectMode(scanner) == "2"
 	if isEchoMode {
 		*useVoice = true
-		// Start recording immediately
-		var err error
-		preRecDir, err = os.MkdirTemp("", "cs-echo-rec")
-		if err != nil {
-			log.Fatalf("Failed to create temp dir: %v", err)
-		}
-		preRecPath = filepath.Join(preRecDir, "current.wav")
-
-		// Context for recording (separate from main ctx which might be cancelled?)
-		// Actually use background context for now
-		preRecCmd, preRecStdin, err = startAudioRecording(context.Background(), preRecPath, *audioDevice)
-		if err != nil {
-			log.Printf("Warning: Failed to start early recording: %v", err)
-		} else {
-			fmt.Println("Background recording started.")
-		}
 	} else if !*useVoice {
 		*useVoice = promptVoiceEnable(scanner)
 	}
 
-	// --- Environment Check & Setup ---
-	if err := ensureEnvironment(scanner, *useVoice); err != nil {
+	env, err := setup.EnsureEnvironment(scanner, *ollamaModel, *useVoice)
+	if err != nil {
 		log.Fatalf("Setup failed: %v", err)
 	}
 
-	ctx := context.Background()
-	tr, err := translator.NewOllamaTranslator(ctx, *ollamaModel, *targetLang)
+	// From here on Ctrl+C shuts down cleanly (stops the speech worker, unloads the model).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	trOpts := translator.Options{CPUOnly: *translateCPU}
+	if *translateCPU {
+		trOpts.Threads = audio.AutoThreads(runtime.NumCPU())
+	}
+	tr, err := translator.NewOllamaTranslator(ctx, *ollamaModel, *targetLang, trOpts)
 	if err != nil {
 		log.Fatalf("Error creating translator: %v", err)
 	}
 	defer tr.Close()
-
 	fmt.Printf("Using Ollama model '%s' for translation to %s\n", *ollamaModel, *targetLang)
 
-	audioListener := initAudioListener(*useVoice)
-	if audioListener != nil {
-		defer audioListener.Stop()
+	var worker *audio.Worker
+	if *useVoice {
+		speechCfg.UV = env.UV
+		speechCfg.DataDir = env.DataDir
+		speechCfg.Live = !isEchoMode // echo mode only transcribes on F9: zero load while idle
+		worker, err = startSpeech(ctx, speechCfg)
+		if err != nil {
+			if isEchoMode || ctx.Err() != nil {
+				log.Fatalf("Voice transcription unavailable: %v", err)
+			}
+			log.Printf("Warning: voice transcription disabled: %v", err)
+		} else {
+			defer worker.Close()
+		}
 	}
 
 	if isEchoMode {
-		if audioListener == nil {
-			log.Fatal("Echo mode requires working audio transcription. Please ensure dependencies are met.")
-		}
-		runEchoMode(ctx, scanner, tr, audioListener, *logPath, *audioDevice, preRecCmd, preRecStdin, preRecDir, preRecPath)
+		runEchoMode(ctx, scanner, tr, worker, *logPath)
 	} else {
-		// Clean up pre-recording if it happened (shouldn't happen here but safe)
-		stopRecordingGracefully(preRecCmd, preRecStdin)
-		if preRecDir != "" {
-			os.RemoveAll(preRecDir)
-		}
-		runCS2Mode(ctx, scanner, tr, audioListener, *logPath, *audioDevice, *useVoice)
+		runCS2Mode(ctx, scanner, tr, worker, *logPath)
 	}
+	fmt.Println("\nStopping...")
 }
 
-func startAudioRecording(ctx context.Context, path, device string) (*exec.Cmd, io.WriteCloser, error) {
-	source := device
-	if source == "" || source == "default" {
-		if runtime.GOOS == "linux" {
-			source = audio.GetDefaultMonitorSource()
-		} else {
-			// Windows fallback (simplified)
-			source = "virtual-audio-capturer"
-		}
-	}
-
-	args := []string{}
-	if runtime.GOOS == "linux" {
-		args = []string{"-f", "pulse", "-i", source}
-	} else {
-		args = []string{"-f", "dshow", "-i", "audio=" + source}
-	}
-
-	// Add output format
-	args = append(args, "-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", path)
-
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-	// Suppress stderr to avoid spam, but keep it for debugging if needed
-	// cmd.Stderr = os.Stderr
-
-	stdin, err := cmd.StdinPipe()
+func startSpeech(ctx context.Context, cfg audio.Config) (*audio.Worker, error) {
+	cfg = cfg.Resolve()
+	fmt.Printf("Starting speech recognition (Whisper '%s' on %s, %d thread(s))...\n", cfg.Model, cfg.Device, cfg.Threads)
+	fmt.Println("The first start installs the speech engine and downloads the model; this takes a few minutes once.")
+	w, err := audio.Start(ctx, cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get stdin pipe: %w", err)
+		return nil, err
 	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, nil, fmt.Errorf("failed to start ffmpeg: %w", err)
-	}
-	return cmd, stdin, nil
+	fmt.Printf("✔ Speech recognition ready: %s (%s, %s), listening to: %s\n",
+		w.Info.Model, w.Info.Device, w.Info.ComputeType, w.Info.AudioDevice)
+	return w, nil
 }
 
-func runEchoMode(ctx context.Context, scanner *bufio.Scanner, tr *translator.OllamaTranslator, listener *audio.Listener, logPath string, device string, initialCmd *exec.Cmd, initialStdin io.WriteCloser, tmpDir string, initialPath string) {
-	fmt.Println("\n=== Echo Mode Started ===")
-	fmt.Println("Listening to system output audio + Monitoring CS2 Console...")
-	fmt.Println("Press F9 to capture the last 15 seconds, transcribe, and translate.")
-	fmt.Println("Press Ctrl+C to exit.")
-
-	// --- Console Monitor Setup ---
-	// Find log file
+// openLogMonitor tails the CS2 console log. If wait is true it keeps looking
+// until CS2 has created the file.
+func openLogMonitor(ctx context.Context, logPath string, wait bool) *monitor.Monitor {
 	path := logPath
 	if path == "" {
-		fmt.Println("Auto-detecting log file location...")
-		path, _ = findLogFile() // Ignore error, just try once silently or use empty
-		if path != "" {
-			fmt.Printf("Found log file: %s\n", path)
-		} else {
-			fmt.Println("Warning: Could not auto-detect log file. Console translation disabled until restart with -log flag.")
+		fmt.Println("Auto-detecting CS2 console log...")
+		waiting := false
+		for {
+			p, err := findLogFile()
+			if err == nil {
+				if waiting {
+					fmt.Println()
+				}
+				path = p
+				break
+			}
+			if !wait {
+				fmt.Println("Warning: CS2 console.log not found, chat translation disabled (use -log to set it).")
+				return nil
+			}
+			if !waiting {
+				fmt.Println("Log file not found yet. Waiting for CS2 to start...")
+				waiting = true
+			}
+			fmt.Print(".")
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(2 * time.Second):
+			}
 		}
 	}
+	fmt.Printf("Monitoring log file: %s\n", path)
+	mon, err := monitor.NewMonitor(path)
+	if err != nil {
+		log.Printf("Error monitoring log file: %v", err)
+		return nil
+	}
+	return mon
+}
 
-	var mon *monitor.Monitor
+func handleChatLine(ctx context.Context, tr *translator.OllamaTranslator, line *tail.Line) {
+	if line.Err != nil {
+		return
+	}
+	msg := parser.ParseLine(line.Text)
+	if msg == nil {
+		return
+	}
+	translated, err := tr.Translate(ctx, msg.MessageContent)
+	if err != nil {
+		log.Printf("Translation error: %v", err)
+		translated = "[Translation Pending/Error]"
+	}
+	outputChat(msg.PlayerName, translated, msg.IsDead, msg.OriginalText)
+}
+
+func runEchoMode(ctx context.Context, scanner *bufio.Scanner, tr *translator.OllamaTranslator, worker *audio.Worker, logPath string) {
+	fmt.Println("\n=== Echo Mode Started ===")
+	fmt.Println("Listening to system audio + monitoring the CS2 console.")
+	fmt.Printf("Press F9 (or Enter in this window) to transcribe and translate the last %d seconds.\n", captureSeconds)
+	fmt.Println("Press Ctrl+C to exit.")
+
 	var logLines chan *tail.Line
-	if path != "" {
-		fmt.Printf("Monitoring log file: %s\n", path)
-		var err error
-		mon, err = monitor.NewMonitor(path)
-		if err != nil {
-			log.Printf("Error creating monitor: %v", err)
-		} else {
-			// defer mon.Stop() // Cannot defer in loop/long running function easily if not careful, but okay here as we return on exit
-			// Actually we should handle stop manually on exit
-			logLines = mon.Lines()
-		}
-	}
-	// -----------------------------
-
-	if tmpDir == "" {
-		// Fallback if pre-recording failed or didn't run
-		var err error
-		tmpDir, err = os.MkdirTemp("", "cs-echo-rec")
-		if err != nil {
-			log.Fatalf("Failed to create temp dir: %v", err)
-		}
-	}
-	defer os.RemoveAll(tmpDir)
-
-	currentRecPath := initialPath
-	if currentRecPath == "" {
-		currentRecPath = filepath.Join(tmpDir, "current.wav")
+	if mon := openLogMonitor(ctx, logPath, false); mon != nil {
+		defer mon.Stop()
+		logLines = mon.Lines()
 	}
 
-	currentCmd := initialCmd
-	currentStdin := initialStdin
-	if currentCmd == nil {
-		var err error
-		currentCmd, currentStdin, err = startAudioRecording(ctx, currentRecPath, device)
-		if err != nil {
-			log.Printf("Failed to start recording: %v", err)
-		}
-	}
-
-	defer func() {
-		stopRecordingGracefully(currentCmd, currentStdin)
-		stopDockerContainer()
-	}()
-
-	// Hotkey Listener
 	hk := hotkey.NewListener(hotkey.KeyF9)
 	hkErr := make(chan error, 1)
 	go func() {
-		if err := hk.Start(ctx); err != nil {
+		if err := hk.Start(ctx); err != nil && ctx.Err() == nil {
 			hkErr <- err
 		}
 	}()
 
-	transcriptions := listener.Transcriptions()
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
+	// Enter in the terminal always works too (e.g. macOS, or Linux without 'input' group).
+	enter := make(chan struct{}, 1)
+	go func() {
+		for scanner.Scan() {
+			select {
+			case enter <- struct{}{}:
+			default:
+			}
+		}
+	}()
+
+	vt := newVoiceTranslator(tr)
+	capture := func(trigger string) {
+		fmt.Printf("\n[%s] Transcribing the last %d seconds...\n", trigger, captureSeconds)
+		if err := worker.Capture(captureSeconds); err != nil {
+			log.Printf("Capture failed: %v", err)
+		}
+	}
 
 	for {
 		select {
-		case <-interrupt:
-			fmt.Println("\nStopping...")
+		case <-ctx.Done():
 			return
 		case err := <-hkErr:
-			log.Printf("Hotkey error: %v", err)
-			return
-
-		// Console Monitor Case
+			fmt.Printf("Global F9 hotkey unavailable (%v).\nPress Enter in this window to capture instead.\n", err)
 		case line, ok := <-logLines:
 			if !ok {
-				logLines = nil // Stop listening if closed
+				logLines = nil
 				continue
 			}
-			if line.Err != nil {
-				continue
-			}
-			msg := parser.ParseLine(line.Text)
-			if msg != nil {
-				translated, err := tr.Translate(ctx, msg.MessageContent)
-				if err != nil {
-					translated = "[Translation Pending/Error]"
-				}
-				outputChat(msg.PlayerName, translated, msg.IsDead, msg.OriginalText)
-			}
-
+			handleChatLine(ctx, tr, line)
 		case <-hk.KeyPressed():
-			fmt.Println("\n[F9] Capturing...")
-
-			stopRecordingGracefully(currentCmd, currentStdin)
-
-			if _, err := os.Stat(currentRecPath); os.IsNotExist(err) {
-				log.Printf("Recording file not found: %s (Audio capture might have failed to start)", currentRecPath)
-				currentCmd, currentStdin, _ = startAudioRecording(ctx, currentRecPath, device)
+			capture("F9")
+		case <-enter:
+			capture("Enter")
+		case t, ok := <-worker.Transcripts():
+			if !ok {
+				log.Println("Speech worker stopped unexpectedly.")
+				return
+			}
+			if t.Empty {
+				fmt.Println("No speech found in that audio.")
 				continue
 			}
-
-			lastRecPath := filepath.Join(tmpDir, fmt.Sprintf("rec_%d.wav", time.Now().UnixNano()))
-
-			if err := renameWithRetry(currentRecPath, lastRecPath); err != nil {
-				log.Printf("Failed to rename recording file: %v", err)
-				os.Remove(currentRecPath)
-				currentCmd, currentStdin, _ = startAudioRecording(ctx, currentRecPath, device)
-				continue
-			}
-
-			currentCmd, currentStdin, _ = startAudioRecording(ctx, currentRecPath, device)
-
-			sliceAudioFile(lastRecPath, tmpDir, listener)
-
-		case text := <-transcriptions:
-			parts := strings.Split(text, "|")
-			content := parts[0]
-			fmt.Printf("\nOriginal: %s\n", content)
-
-			translated, err := tr.Translate(ctx, content)
-			if err != nil {
-				log.Printf("Translation error: %v", err)
-				continue
-			}
-			// Color output
-			fmt.Printf("\033[1;32mTranslated: %s\033[0m\n", translated)
+			vt.print(ctx, t)
 		}
 	}
 }
 
-func runCS2Mode(ctx context.Context, scanner *bufio.Scanner, tr *translator.OllamaTranslator, audioListener *audio.Listener, logPath string, audioDevice string, useVoice bool) {
-	// Check if -condebug is configured
+func runCS2Mode(ctx context.Context, scanner *bufio.Scanner, tr *translator.OllamaTranslator, worker *audio.Worker, logPath string) {
 	if err := checkCondebug(scanner); err != nil {
 		fmt.Printf("Warning: Could not verify launch options: %v\n", err)
 	}
 
-	// Find log file
-	path := logPath
-	if path == "" {
-		fmt.Println("Auto-detecting log file location...")
-		firstAttempt := true
-		for {
-			var err error
-			path, err = findLogFile()
-			if err == nil {
-				if !firstAttempt {
-					fmt.Println("")
-				}
-				fmt.Printf("Found log file: %s\n", path)
-				break
-			}
-			if firstAttempt {
-				fmt.Println("Log file not found yet. Waiting for CS2 to start...")
-				firstAttempt = false
-			}
-			fmt.Print(".")
-			time.Sleep(2 * time.Second)
-		}
-	}
-
-	fmt.Printf("Monitoring log file: %s\n", path)
-
-	mon, err := monitor.NewMonitor(path)
-	if err != nil {
-		log.Fatalf("Error creating monitor: %v", err)
+	mon := openLogMonitor(ctx, logPath, true)
+	if mon == nil {
+		return
 	}
 	defer mon.Stop()
-
-	if useVoice && audioListener != nil {
-		if err := audioListener.Start(ctx, audioDevice); err != nil {
-			log.Printf("Warning: Failed to start audio capture: %v", err)
-		} else {
-			fmt.Printf("Local Audio transcription enabled (Whisper '%s' model).\n", translator.DefaultWhisperModel)
-		}
-	}
-
-	// Handle Ctrl+C
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
 	logLines := mon.Lines()
-	var audioChan <-chan string
-	if audioListener != nil {
-		audioChan = audioListener.Transcriptions()
-	}
 
-	// Voice context buffer logic
-	var voiceContext []voiceContextItem
+	var transcripts <-chan audio.Transcript
+	if worker != nil {
+		transcripts = worker.Transcripts()
+	}
+	vt := newVoiceTranslator(tr)
 
 	fmt.Println("Waiting for chat messages...")
-
-loop:
 	for {
 		select {
-		case <-c:
-			fmt.Println("\nStopping...")
-			stopDockerContainer()
-			break loop
-
+		case <-ctx.Done():
+			return
 		case line, ok := <-logLines:
 			if !ok {
-				break loop
+				return
 			}
-			if line.Err != nil {
-				continue
-			}
-			msg := parser.ParseLine(line.Text)
-			if msg != nil {
-				translated, err := tr.Translate(ctx, msg.MessageContent)
-				if err != nil {
-					translated = "[Translation Pending/Error]"
-				}
-				outputChat(msg.PlayerName, translated, msg.IsDead, msg.OriginalText)
-			}
-
-		case text, ok := <-audioChan:
+			handleChatLine(ctx, tr, line)
+		case t, ok := <-transcripts:
 			if !ok {
-				audioChan = nil
+				log.Println("Speech worker stopped; continuing with chat translation only.")
+				transcripts = nil
 				continue
 			}
-
-			translated, prefix, transcribeDuration := handleVoiceTranscription(ctx, tr, text, voiceContext)
-			fmt.Printf("Voice %.2fs: %s \n", transcribeDuration, text)
-			outputChat(prefix, translated, false, "")
+			vt.print(ctx, t)
 		}
 	}
 }
-
-// ... Helper functions (copied from original) ...
 
 func outputChat(name, text string, isDead bool, originalLine string) {
 	if originalLine != "" {

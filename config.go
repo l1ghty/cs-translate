@@ -7,8 +7,6 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
-
-	"github.com/micha/cs-ingame-translate/setup"
 )
 
 func checkCondebug(scanner *bufio.Scanner) error {
@@ -43,17 +41,18 @@ func checkCondebug(scanner *bufio.Scanner) error {
 }
 
 func findCondebugInConfigs(dataPaths []string) (bool, bool) {
-	configPaths := getConfigFilePaths(dataPaths)
-	for _, configPath := range configPaths {
+	found := false
+	for _, configPath := range getConfigFilePaths(dataPaths) {
 		contentBytes, err := os.ReadFile(configPath)
 		if err != nil {
 			continue
 		}
+		found = true
 		if strings.Contains(string(contentBytes), "-condebug") {
 			return true, true
 		}
 	}
-	return len(dataPaths) > 0, false
+	return found, false
 }
 
 func openSteamSettings() error {
@@ -70,16 +69,4 @@ func openSteamSettings() error {
 		return fmt.Errorf("unsupported OS")
 	}
 	return cmd.Start()
-}
-
-func stopDockerContainer() {
-	cmd := exec.Command("docker", "stop", "cs-translate")
-	cmd.Run()
-}
-
-func ensureEnvironment(scanner *bufio.Scanner, useVoice bool) error {
-	if err := setup.EnsureEnvironment(scanner, useVoice); err != nil {
-		return fmt.Errorf("setup failed: %v", err)
-	}
-	return nil
 }

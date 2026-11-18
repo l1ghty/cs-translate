@@ -1,33 +1,38 @@
+// Package setup installs and configures everything cs-translate needs:
+// a native Ollama server plus translation model, and (for voice) uv, which
+// in turn provides Python and the speech-recognition packages. No Docker,
+// no system Python, no ffmpeg and no admin rights are required for voice.
 package setup
 
 import (
 	"bufio"
-	_ "embed"
 	"fmt"
-	"os"
 )
 
-//go:embed Dockerfile
-var dockerfileContent []byte
+// Environment is the result of a successful setup.
+type Environment struct {
+	UV      string // path to uv, empty when voice is disabled
+	DataDir string // AppDir()
+}
 
-//go:embed transcriber.py
-var transcriberScript []byte
+// EnsureEnvironment checks (and if needed installs) all dependencies.
+func EnsureEnvironment(scanner *bufio.Scanner, ollamaModel string, useVoice bool) (*Environment, error) {
+	dir, err := AppDir()
+	if err != nil {
+		return nil, fmt.Errorf("cannot create data directory: %w", err)
+	}
+	env := &Environment{DataDir: dir}
 
-func EnsureEnvironment(scanner *bufio.Scanner, useVoice bool) error {
-	if err := SetupOllama(scanner); err != nil {
-		return fmt.Errorf("failed to setup Ollama: %w", err)
+	if err := SetupOllama(scanner, ollamaModel); err != nil {
+		return nil, err
 	}
 
 	if useVoice {
-		if os.Getenv("USE_DOCKER_WHISPER") != "0" {
-			fmt.Println("Using Docker for Whisper transcription (already running in unified container)")
-			os.Setenv("USE_DOCKER_WHISPER", "1")
-		} else {
-			if err := SetupPythonEnv(scanner); err != nil {
-				return fmt.Errorf("failed to setup python environment: %w", err)
-			}
+		uv, err := EnsureUV()
+		if err != nil {
+			return nil, err
 		}
+		env.UV = uv
 	}
-
-	return nil
+	return env, nil
 }

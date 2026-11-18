@@ -3,50 +3,45 @@ package translator
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
-	"strconv"
+	"strings"
 )
 
 const (
-	DefaultOllamaPort    = 11434
-	DefaultOllamaBaseURL = "http://localhost"
-	DefaultOllamaModel   = "hf.co/blackcloud1199/qwen-translation-vi"
-	DefaultWhisperModel  = "turbo"
+	DefaultOllamaPort  = 11434
+	DefaultOllamaModel = "hf.co/blackcloud1199/qwen-translation-vi"
 )
 
-var OllamaHost string
+// OllamaHost is the base URL of the Ollama API, e.g. http://localhost:11434.
+var OllamaHost = GetOllamaHost()
 
-func init() {
-	OllamaHost = GetOllamaHost()
-}
-
+// GetOllamaHost returns the Ollama base URL, honouring OLLAMA_HOST. Ollama
+// itself accepts values like "0.0.0.0", "localhost:11434" or
+// "http://host:port", so all of those are normalised to a usable URL.
 func GetOllamaHost() string {
-	if envHost := os.Getenv("OLLAMA_HOST"); envHost != "" {
-		return envHost
-	}
-	return fmt.Sprintf("%s:%d", DefaultOllamaBaseURL, DefaultOllamaPort)
+	return normalizeHost(os.Getenv("OLLAMA_HOST"))
 }
 
-func GetOllamaPort() int {
-	if envHost := os.Getenv("OLLAMA_HOST"); envHost != "" {
-		_, portStr, err := net.SplitHostPort(envHost)
-		if err == nil {
-			if port, err := strconv.Atoi(portStr); err == nil {
-				return port
-			}
-		}
+func normalizeHost(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fmt.Sprintf("http://localhost:%d", DefaultOllamaPort)
 	}
-	return DefaultOllamaPort
-}
-
-func FindAvailablePort(startPort int) (int, error) {
-	for port := startPort; port <= 65535; port++ {
-		ln, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", port))
-		if err == nil {
-			ln.Close()
-			fmt.Printf("alternative Port %d is available\n", port)
-			return port, nil
-		}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
 	}
-	return 0, fmt.Errorf("no available port found in range %d-65535", startPort)
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Sprintf("http://localhost:%d", DefaultOllamaPort)
+	}
+	host, port, err := net.SplitHostPort(u.Host)
+	if err != nil { // no port given
+		host, port = u.Hostname(), fmt.Sprint(DefaultOllamaPort)
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		host = "localhost" // listen-all address: connect locally
+	}
+	return fmt.Sprintf("%s://%s", u.Scheme, net.JoinHostPort(host, port))
 }

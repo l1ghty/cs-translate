@@ -2,11 +2,12 @@ package setup
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,168 +18,233 @@ import (
 	"github.com/micha/cs-ingame-translate/translator"
 )
 
-type OllamaVersionResponse struct {
-	Version string `json:"version"`
+// SetupOllama makes sure a native Ollama server is reachable and the
+// translation model is available, installing Ollama if needed.
+func SetupOllama(scanner *bufio.Scanner, model string) error {
+	fmt.Println("Checking Ollama (translation engine)...")
+	base := translator.OllamaHost
+
+	if _, err := ollamaVersion(base); err != nil {
+		bin := findOllama()
+		if bin == "" {
+			fmt.Println("Ollama is not installed. It runs the local translation model.")
+			if !askYesNo(scanner, "Install Ollama now?") {
+				return fmt.Errorf("ollama is required for translation (https://ollama.com/download)")
+			}
+			if err := installOllama(scanner); err != nil {
+				return err
+			}
+			bin = findOllama()
+		}
+		if _, err := ollamaVersion(base); err != nil {
+			if bin == "" {
+				return fmt.Errorf("ollama was installed but could not be found; open a new terminal or start Ollama, then run again")
+			}
+			if err := startOllama(bin, base); err != nil {
+				return err
+			}
+		}
+	}
+
+	version, err := ollamaVersion(base)
+	if err != nil {
+		return fmt.Errorf("ollama is not responding at %s: %w", base, err)
+	}
+	fmt.Printf("✔ Ollama is running (version %s)\n", version)
+	return ensureModel(scanner, base, model)
 }
 
-func SetupOllama(scanner *bufio.Scanner) error {
-	fmt.Println("Checking Ollama installation...")
-
-	useDocker := os.Getenv("USE_DOCKER_OLLAMA") != "0"
-
-	if os.Getenv("USE_DOCKER_OLLAMA") == "" && runtime.GOOS == "windows" {
-		if err := CheckDocker(); err != nil {
-			fmt.Println("Docker not detected. Defaulting to native installation.")
-			useDocker = false
-		} else {
-			fmt.Println("Select installation method:")
-			fmt.Println("1. Docker (Recommended - Unified container)")
-			fmt.Println("2. Native (Run Ollama and Python directly on Windows)")
-			fmt.Print("Enter choice [1]: ")
-			if scanner.Scan() {
-				input := strings.TrimSpace(scanner.Text())
-				if input == "2" {
-					useDocker = false
-				}
-			}
-		}
-
-		if !useDocker {
-			os.Setenv("USE_DOCKER_OLLAMA", "0")
-			os.Setenv("USE_DOCKER_WHISPER", "0")
-		}
-	}
-
-	if useDocker {
-		return SetupDockerContainer(scanner)
-	}
-
-	ollamaURL := translator.OllamaHost
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(ollamaURL + "/api/version")
+func ollamaVersion(base string) (string, error) {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(base + "/api/version")
 	if err != nil {
-		fmt.Printf("Ollama is not running or not accessible at %s\n", ollamaURL)
-		fmt.Println("Ollama is required for translation.")
-		fmt.Println("you can set USE_DOCKER_OLLAMA=0 for no isolation in docker (more performant).")
-		fmt.Print("Do you want to install Ollama (with docker)? [Y/n]: ")
-		if scanner.Scan() {
-			input := strings.TrimSpace(scanner.Text())
-			if input == "" || strings.ToLower(input) == "y" || strings.ToLower(input) == "yes" {
-				if err := InstallOllama(scanner); err != nil {
-					return err
-				}
-			} else {
-				return fmt.Errorf("Ollama is required for translation")
-			}
-		}
-		resp, err = client.Get(ollamaURL + "/api/version")
-		if err != nil {
-			return fmt.Errorf("Ollama still not accessible after installation")
-		}
+		return "", err
 	}
 	defer resp.Body.Close()
-
-	var versionResp OllamaVersionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&versionResp); err == nil {
-		fmt.Printf("✔ Ollama is running (version: %s)\n", versionResp.Version)
-	} else {
-		fmt.Println("✔ Ollama is running")
+	var v struct {
+		Version string `json:"version"`
 	}
-
-	model := translator.DefaultOllamaModel
-	fmt.Printf("Checking for Ollama model '%s'...\n", model)
-	return CheckAndPullModel(scanner, model)
+	json.NewDecoder(resp.Body).Decode(&v)
+	return v.Version, nil
 }
 
-func InstallOllama(scanner *bufio.Scanner) error {
-	if runtime.GOOS == "windows" {
-		fmt.Println("Installing Ollama for Windows...")
-		fmt.Println("Downloading Ollama installer...")
-
-		installerURL := "https://ollama.com/download/OllamaSetup.exe"
-		tmpDir := os.TempDir()
-		installerPath := filepath.Join(tmpDir, "OllamaSetup.exe")
-
-		if err := DownloadFile(installerURL, installerPath); err != nil {
-			fmt.Printf("Failed to download installer: %v\n", err)
-			fmt.Println("Please download Ollama manually from: https://ollama.com")
-			return fmt.Errorf("failed to download Ollama")
+// findOllama looks for the ollama binary on PATH and in the default install locations.
+func findOllama() string {
+	if p, err := exec.LookPath("ollama"); err == nil {
+		return p
+	}
+	var candidates []string
+	switch runtime.GOOS {
+	case "windows":
+		if dir := os.Getenv("LOCALAPPDATA"); dir != "" {
+			candidates = append(candidates, filepath.Join(dir, "Programs", "Ollama", "ollama.exe"))
 		}
-		defer os.Remove(installerPath)
-
-		fmt.Println("Running Ollama installer...")
-		// Use start command to ensure the installer window gets focus
-		cmd := exec.Command("cmd", "/c", "start", "/wait", "Ollama Setup", installerPath)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("installer failed: %w", err)
+		candidates = append(candidates, `C:\Program Files\Ollama\ollama.exe`)
+	case "darwin":
+		candidates = []string{
+			"/Applications/Ollama.app/Contents/Resources/ollama",
+			"/opt/homebrew/bin/ollama",
+			"/usr/local/bin/ollama",
 		}
-
-		fmt.Println("✔ Ollama installed. Starting service...")
-		time.Sleep(3 * time.Second)
-		return nil
+	default:
+		candidates = []string{"/usr/local/bin/ollama", "/usr/bin/ollama"}
 	}
-
-	fmt.Println("Installing Ollama for Linux...")
-	cmd := exec.Command("sh", "-c", "curl -fsSL https://ollama.com/install.sh | sh")
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		fmt.Printf("Automatic installation failed: %v\n", err)
-		fmt.Println("Please install Ollama manually:")
-		fmt.Println("  curl -fsSL https://ollama.com/install.sh | sh")
-		return fmt.Errorf("failed to install Ollama")
-	}
-
-	fmt.Println("✔ Ollama installed successfully")
-	fmt.Println("Starting Ollama service...")
-
-	port := translator.DefaultOllamaPort
-	ln, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", port))
-	if err != nil {
-		fmt.Printf("Port %d is already in use. Looking for an available port...\n", port)
-		port, err = translator.FindAvailablePort(port + 1)
-		if err != nil {
-			return fmt.Errorf("could not find an available port: %w", err)
+	for _, c := range candidates {
+		if fileExists(c) {
+			return c
 		}
-		fmt.Printf("Using alternative port: %d\n", port)
-		fmt.Println("Note: You'll need to set OLLAMA_HOST to use this port.")
-		fmt.Printf("Run: export OLLAMA_HOST=http://localhost:%d\n", port)
-	} else {
-		ln.Close()
 	}
+	return ""
+}
 
-	env := os.Environ()
-	env = append(env, fmt.Sprintf("OLLAMA_HOST=localhost:%d", port))
-	ollamaCmd := exec.Command("ollama", "serve")
-	ollamaCmd.Env = env
-	ollamaCmd.Stdout = os.Stdout
-	ollamaCmd.Stderr = os.Stderr
-	if err := ollamaCmd.Start(); err != nil {
-		fmt.Printf("Warning: Could not start Ollama service: %v\n", err)
+func installOllama(scanner *bufio.Scanner) error {
+	switch runtime.GOOS {
+	case "windows":
+		tmp := filepath.Join(os.TempDir(), "OllamaSetup.exe")
+		fmt.Println("Downloading the Ollama installer...")
+		if err := downloadFile("https://ollama.com/download/OllamaSetup.exe", tmp); err != nil {
+			return fmt.Errorf("download failed (%v); install Ollama from https://ollama.com/download", err)
+		}
+		defer os.Remove(tmp)
+		fmt.Println("Running the Ollama installer, follow the window that opens...")
+		// "start /wait" gives the installer window focus and waits for it
+		if err := runVisible("cmd", "/c", "start", "/wait", "Ollama Setup", tmp); err != nil {
+			return fmt.Errorf("ollama installer failed: %w", err)
+		}
+	case "darwin":
+		if _, err := exec.LookPath("brew"); err == nil {
+			if err := runVisible("brew", "install", "ollama"); err != nil {
+				return fmt.Errorf("brew install ollama failed: %w", err)
+			}
+			break
+		}
+		fmt.Println("Opening https://ollama.com/download - install Ollama, start it, then press Enter here.")
+		exec.Command("open", "https://ollama.com/download").Start()
+		if !AssumeYes {
+			scanner.Scan()
+		}
+	default:
+		tmp := filepath.Join(os.TempDir(), "ollama-install.sh")
+		if err := downloadFile("https://ollama.com/install.sh", tmp); err != nil {
+			return fmt.Errorf("download failed (%v); see https://ollama.com/download/linux", err)
+		}
+		defer os.Remove(tmp)
+		fmt.Println("Running the official Ollama install script (may ask for your sudo password)...")
+		if err := runVisible("sh", tmp); err != nil {
+			return fmt.Errorf("ollama install script failed: %w", err)
+		}
 	}
-	time.Sleep(2 * time.Second)
-
+	fmt.Println("✔ Ollama installed")
 	return nil
 }
 
-func DownloadFile(url string, dest string) error {
-	resp, err := http.Get(url)
+// startOllama starts "ollama serve" in the background and waits for it.
+func startOllama(bin, base string) error {
+	if u, err := url.Parse(base); err == nil && portInUse(u.Host) {
+		return fmt.Errorf("port %s is used by another program and Ollama does not answer there; set OLLAMA_HOST to a free address", u.Port())
+	}
+	fmt.Println("Starting Ollama...")
+	cmd := exec.Command(bin, "serve")
+	cmd.Env = append(os.Environ(),
+		"OLLAMA_HOST="+strings.TrimPrefix(strings.TrimPrefix(base, "http://"), "https://"),
+		// keep memory use predictable while gaming
+		"OLLAMA_MAX_LOADED_MODELS=1",
+		"OLLAMA_NUM_PARALLEL=1",
+	)
+	if dir, err := AppDir(); err == nil {
+		if f, err := os.Create(filepath.Join(dir, "ollama.log")); err == nil {
+			cmd.Stdout, cmd.Stderr = f, f
+		}
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("could not start ollama: %w", err)
+	}
+	go cmd.Wait()
+	for i := 0; i < 30; i++ {
+		if _, err := ollamaVersion(base); err == nil {
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("ollama did not start within 30s")
+}
+
+func portInUse(hostport string) bool {
+	conn, err := net.DialTimeout("tcp", hostport, time.Second)
 	if err != nil {
-		return err
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// ensureModel pulls the translation model through the Ollama API (works even
+// when the ollama CLI is not on PATH yet, e.g. right after installing).
+func ensureModel(scanner *bufio.Scanner, base, model string) error {
+	if hasModel(base, model) {
+		fmt.Printf("✔ Translation model '%s' is installed\n", model)
+		return nil
+	}
+	fmt.Printf("Translation model '%s' is not downloaded yet.\n", model)
+	if !askYesNo(scanner, "Download it now? (one-time, ~1-2 GB)") {
+		return fmt.Errorf("model '%s' is required for translation", model)
+	}
+	body, _ := json.Marshal(map[string]any{"model": model, "stream": true})
+	resp, err := http.Post(base+"/api/pull", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("pulling model: %w", err)
 	}
 	defer resp.Body.Close()
 
-	out, err := os.Create(dest)
-	if err != nil {
-		return err
+	dec := json.NewDecoder(resp.Body)
+	lastStatus := ""
+	for {
+		var p struct {
+			Status    string `json:"status"`
+			Total     int64  `json:"total"`
+			Completed int64  `json:"completed"`
+			Error     string `json:"error"`
+		}
+		if err := dec.Decode(&p); err != nil {
+			break
+		}
+		if p.Error != "" {
+			fmt.Println()
+			return fmt.Errorf("pulling model: %s", p.Error)
+		}
+		if p.Total > 0 {
+			fmt.Printf("\r  %s: %5.1f%% of %d MB   ", p.Status, float64(p.Completed)*100/float64(p.Total), p.Total>>20)
+		} else if p.Status != lastStatus {
+			fmt.Printf("\n  %s", p.Status)
+		}
+		lastStatus = p.Status
 	}
-	defer out.Close()
+	fmt.Println()
+	if !hasModel(base, model) {
+		return fmt.Errorf("model '%s' could not be downloaded", model)
+	}
+	fmt.Printf("✔ Translation model '%s' downloaded\n", model)
+	return nil
+}
 
-	_, err = io.Copy(out, resp.Body)
-	return err
+func hasModel(base, model string) bool {
+	resp, err := http.Get(base + "/api/tags")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	var tags struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&tags) != nil {
+		return false
+	}
+	for _, m := range tags.Models {
+		if m.Name == model || strings.TrimSuffix(m.Name, ":latest") == model || strings.HasPrefix(m.Name, model+":") {
+			return true
+		}
+	}
+	return false
 }
