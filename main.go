@@ -67,7 +67,13 @@ func main() {
 		return
 	}
 
-	mode := selectMode(scanner, speechCfg.MaxSpeechSecs)
+	langSet := false
+	flag.Visit(func(f *flag.Flag) { langSet = langSet || f.Name == "lang" })
+	if saved := savedTargetLanguage(); saved != "" && !langSet {
+		*targetLang = saved
+	}
+	var mode string
+	mode, *targetLang = selectMode(scanner, speechCfg.MaxSpeechSecs, *targetLang)
 	isEchoMode := mode == modeEcho
 	needsVoice := mode != modeCS2 // modes 2 and 3 are about voice
 	if needsVoice {
