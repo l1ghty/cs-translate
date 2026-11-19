@@ -18,6 +18,8 @@ It is built to stay out of your game's way, even on weaker PCs. Setup is automat
 | **Speech engine** (voice) | A private copy of [uv](https://docs.astral.sh/uv/) (~20 MB, checksum-verified) is downloaded. uv installs its own Python plus faster-whisper. No system Python, admin rights, or PATH changes are needed. |
 | **Whisper model** | Downloaded once. The size is chosen to match your PC (see [Performance](#performance)). |
 
+Before installing, it lists everything that is missing and asks once whether to install all of it. Answer **y** and the rest of the setup runs without further questions; answer **n** to confirm each step separately.
+
 To install everything ahead of time without being asked any questions (handy before a match, or for scripting), run:
 
 ```bash

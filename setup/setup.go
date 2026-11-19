@@ -7,6 +7,8 @@ package setup
 import (
 	"bufio"
 	"fmt"
+
+	"github.com/micha/cs-ingame-translate/translator"
 )
 
 // Environment is the result of a successful setup.
@@ -23,6 +25,17 @@ func EnsureEnvironment(scanner *bufio.Scanner, ollamaModel string, useVoice bool
 	}
 	env := &Environment{DataDir: dir}
 
+	if missing := missingComponents(ollamaModel, useVoice); len(missing) > 0 && !AssumeYes {
+		fmt.Println("These components are missing and need to be installed:")
+		for _, m := range missing {
+			fmt.Println("  • " + m)
+		}
+		confirmAll = askYesNo(scanner, "Install all of them now, without asking again?")
+		if !confirmAll {
+			fmt.Println("OK, you will be asked before each step.")
+		}
+	}
+
 	if err := SetupOllama(scanner, ollamaModel); err != nil {
 		return nil, err
 	}
@@ -35,4 +48,25 @@ func EnsureEnvironment(scanner *bufio.Scanner, ollamaModel string, useVoice bool
 		env.UV = uv
 	}
 	return env, nil
+}
+
+// missingComponents lists what setup will have to install, so the user can
+// agree to all of it at once.
+func missingComponents(ollamaModel string, useVoice bool) []string {
+	var missing []string
+	base := translator.OllamaHost
+	_, err := ollamaVersion(base)
+	running := err == nil
+	if !running && findOllama() == "" {
+		missing = append(missing, "Ollama (runs the translation model locally)")
+	}
+	// The model list can only be checked while Ollama runs; an installed but
+	// stopped Ollama usually has the model already, so don't guess there.
+	if (running && !hasModel(base, ollamaModel)) || (!running && findOllama() == "") {
+		missing = append(missing, fmt.Sprintf("Translation model '%s' (one-time download, ~1-2 GB)", ollamaModel))
+	}
+	if useVoice && findUV() == "" {
+		missing = append(missing, "Speech engine: uv (~20 MB), Python, faster-whisper and a Whisper model")
+	}
+	return missing
 }
