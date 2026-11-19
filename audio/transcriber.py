@@ -4,6 +4,7 @@
 #   "faster-whisper>=1.2,<2",
 #   "soundcard>=0.4.4",
 #   "numpy>=1.26",
+#   "msvc-runtime; sys_platform == 'win32'",
 # ]
 # ///
 """cs-translate speech worker.
@@ -83,6 +84,41 @@ def lower_priority():
             os.nice(10)
     except Exception as e:  # never fatal
         log(f"could not lower process priority: {e}")
+
+
+def ensure_msvc_runtime():
+    """Make sure the Microsoft C++ runtime (msvcp140.dll) can be found on Windows.
+
+    ctranslate2.dll needs it, but the Python that uv installs only ships the C
+    runtime (vcruntime140*.dll), and many PCs don't have the "Visual C++
+    Redistributable" installed. The msvc-runtime wheel puts the DLLs into the
+    environment; load them from there when the system has none, so loading
+    ctranslate2 never fails with "Could not find module ... ctranslate2.dll".
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        ctypes.WinDLL("msvcp140.dll")  # system-wide Visual C++ Redistributable
+        return
+    except OSError:
+        pass
+    dirs = [d for d in (sys.prefix, os.path.join(sys.prefix, "Scripts"))
+            if os.path.isfile(os.path.join(d, "msvcp140.dll"))]
+    for d in dirs:
+        _dll_dirs.append(os.add_dll_directory(d))
+    for d in dirs:
+        try:
+            # Once loaded, every later import of msvcp140.dll resolves to this
+            # copy. vcruntime140.dll is already loaded by Python itself.
+            ctypes.WinDLL(os.path.join(d, "msvcp140.dll"))
+            return
+        except OSError as e:
+            log(f"could not load the bundled C++ runtime from {d}: {e}")
+    emit("warning", message="Microsoft Visual C++ runtime (msvcp140.dll) not found; if speech "
+         "recognition fails to start, install the Visual C++ Redistributable: "
+         "https://aka.ms/vs/17/release/vc_redist.x64.exe")
 
 
 def preload_cuda_libs():
@@ -572,6 +608,7 @@ def main():
         os.environ[var] = threads
     warnings.filterwarnings("ignore")
     lower_priority()
+    ensure_msvc_runtime()
 
     if args.list_devices:
         status("Looking for audio devices")
