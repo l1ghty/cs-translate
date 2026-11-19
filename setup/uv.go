@@ -44,10 +44,7 @@ func uvAsset() (string, error) {
 // install, otherwise it downloads a private copy into AppDir()/bin (no admin
 // rights, no PATH or shell-profile changes).
 func EnsureUV() (string, error) {
-	if p := os.Getenv("CS_TRANSLATE_UV"); p != "" {
-		return p, nil
-	}
-	if p, err := exec.LookPath("uv"); err == nil {
+	if p := findUV(); p != "" {
 		return p, nil
 	}
 	dir, err := AppDir()
@@ -55,9 +52,6 @@ func EnsureUV() (string, error) {
 		return "", err
 	}
 	local := filepath.Join(dir, "bin", exeName("uv"))
-	if fileExists(local) {
-		return local, nil
-	}
 
 	asset, err := uvAsset()
 	if err != nil {
@@ -69,6 +63,22 @@ func EnsureUV() (string, error) {
 	}
 	fmt.Println("✔ uv installed")
 	return local, nil
+}
+
+// findUV returns the path of an existing uv, or "" if it must be installed.
+func findUV() string {
+	if p := os.Getenv("CS_TRANSLATE_UV"); p != "" {
+		return p
+	}
+	if p, err := exec.LookPath("uv"); err == nil {
+		return p
+	}
+	if dir, err := AppDir(); err == nil {
+		if local := filepath.Join(dir, "bin", exeName("uv")); fileExists(local) {
+			return local
+		}
+	}
+	return ""
 }
 
 func installUV(baseURL, asset, dest string) error {

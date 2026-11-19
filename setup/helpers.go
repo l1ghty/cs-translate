@@ -19,6 +19,10 @@ import (
 // unattended installs (-yes flag).
 var AssumeYes bool
 
+// confirmAll is set when the user agreed up front to install everything
+// that is missing, so the individual install questions are skipped.
+var confirmAll bool
+
 // AppDir is where cs-translate keeps its private tools (uv), the speech
 // worker and downloaded models:
 //
@@ -40,7 +44,7 @@ func AppDir() (string, error) {
 // askYesNo asks a question that defaults to yes.
 func askYesNo(scanner *bufio.Scanner, question string) bool {
 	fmt.Printf("%s [Y/n]: ", question)
-	if AssumeYes {
+	if AssumeYes || confirmAll {
 		fmt.Println("y")
 		return true
 	}
