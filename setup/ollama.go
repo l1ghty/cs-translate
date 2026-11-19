@@ -38,6 +38,11 @@ func SetupOllama(scanner *bufio.Scanner, model string) error {
 				return err
 			}
 			bin = findOllama()
+			// The installers start Ollama's tray app, which brings up the
+			// server by itself; give it a moment instead of racing it.
+			st := ui.Start("Waiting for Ollama to start")
+			waitOllama(base, 15*time.Second)
+			st.Stop()
 		}
 		if _, err := ollamaVersion(base); err != nil {
 			if bin == "" {
@@ -103,15 +108,8 @@ func findOllama() string {
 func installOllama(scanner *bufio.Scanner) error {
 	switch runtime.GOOS {
 	case "windows":
-		tmp := filepath.Join(os.TempDir(), "OllamaSetup.exe")
-		if err := downloadFile("https://ollama.com/download/OllamaSetup.exe", tmp, "Downloading the Ollama installer"); err != nil {
-			return fmt.Errorf("download failed (%v); install Ollama from https://ollama.com/download", err)
-		}
-		defer os.Remove(tmp)
-		fmt.Println("Running the Ollama installer, follow the window that opens...")
-		// "start /wait" gives the installer window focus and waits for it
-		if err := runVisible("cmd", "/c", "start", "/wait", "Ollama Setup", tmp); err != nil {
-			return fmt.Errorf("ollama installer failed: %w", err)
+		if err := installOllamaWindows(); err != nil {
+			return err
 		}
 	case "darwin":
 		if _, err := exec.LookPath("brew"); err == nil {
@@ -140,6 +138,46 @@ func installOllama(scanner *bufio.Scanner) error {
 	return nil
 }
 
+// installOllamaWindows installs Ollama without any clicks: through winget
+// when it is available, otherwise with the official installer in silent
+// mode. Both install per user (%LOCALAPPDATA%\Programs\Ollama), so no
+// admin rights are needed.
+func installOllamaWindows() error {
+	if winget, err := exec.LookPath("winget"); err == nil {
+		fmt.Println("Installing Ollama with winget...")
+		err := runVisible(winget, "install", "--id", "Ollama.Ollama", "--exact", "--silent",
+			"--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
+		if err == nil && findOllama() != "" {
+			return nil
+		}
+		fmt.Printf("winget could not install Ollama (%v), using the official installer instead\n", err)
+	}
+	tmp := filepath.Join(os.TempDir(), "OllamaSetup.exe")
+	if err := downloadFile("https://ollama.com/download/OllamaSetup.exe", tmp, "Downloading the Ollama installer"); err != nil {
+		return fmt.Errorf("download failed (%v); install Ollama from https://ollama.com/download", err)
+	}
+	defer os.Remove(tmp)
+	st := ui.Start("Installing Ollama")
+	err := exec.Command(tmp, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-").Run()
+	st.Stop()
+	if err != nil {
+		return fmt.Errorf("ollama installer failed (%v); install Ollama from https://ollama.com/download", err)
+	}
+	return nil
+}
+
+// waitOllama polls the Ollama server until it answers or the timeout passes.
+func waitOllama(base string, timeout time.Duration) bool {
+	for deadline := time.Now().Add(timeout); ; time.Sleep(500 * time.Millisecond) {
+		if _, err := ollamaVersion(base); err == nil {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+	}
+}
+
 // startOllama starts "ollama serve" in the background and waits for it.
 func startOllama(bin, base string) error {
 	if u, err := url.Parse(base); err == nil && portInUse(u.Host) {
@@ -163,13 +201,10 @@ func startOllama(bin, base string) error {
 		return fmt.Errorf("could not start ollama: %w", err)
 	}
 	go cmd.Wait()
-	for i := 0; i < 60; i++ {
-		if _, err := ollamaVersion(base); err == nil {
-			return nil
-		}
-		time.Sleep(500 * time.Millisecond)
+	if !waitOllama(base, 30*time.Second) {
+		return fmt.Errorf("ollama did not start within 30s")
 	}
-	return fmt.Errorf("ollama did not start within 30s")
+	return nil
 }
 
 func portInUse(hostport string) bool {
