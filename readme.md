@@ -14,7 +14,7 @@ It is built to stay out of your game's way, even on weaker PCs. Setup is automat
 
 | Component | What happens |
 |-----------|--------------|
-| **Ollama** (translation) | Detected if already installed. Otherwise it is installed natively (Windows installer, `brew` on macOS, official script on Linux) and the translation model is downloaded. |
+| **Ollama** (translation) | Detected if already installed. Otherwise it is installed natively without any clicks (`winget` on Windows, or the official installer in silent mode when winget is missing; `brew` on macOS; the official script on Linux) and the translation model is downloaded. |
 | **Speech engine** (voice) | A private copy of [uv](https://docs.astral.sh/uv/) (~20 MB, checksum-verified) is downloaded. uv installs its own Python plus faster-whisper. No system Python, admin rights, or PATH changes are needed. |
 | **Whisper model** | Downloaded once. The size is chosen to match your PC (see [Performance](#performance)). |
 
