@@ -3,7 +3,7 @@
 Translates Counter-Strike 2 chat in real time and transcribes and translates voice chat. Everything runs **locally**:
 
 - **Speech recognition:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (Whisper on CTranslate2, int8) with Silero VAD.
-- **Translation:** a local LLM in [Ollama](https://ollama.com).
+- **Translation:** Tencent's [Hy-MT2 1.8B](https://github.com/Tencent-Hunyuan/Hy-MT2), a small model made only for translation, running locally in [Ollama](https://ollama.com).
 
 It is built to stay out of your game's way, even on weaker PCs. Setup is automatic on Windows, Linux and macOS.
 
@@ -71,7 +71,7 @@ CS2 must be started with the `-condebug` launch option so that it writes `consol
 | `-whisper-threads` | CPU threads for speech recognition (`0` means auto) | `0` |
 | `-audiodevice` | Device to record from, as a name or part of one | what you hear |
 | `-list-audio-devices` | List audio devices and exit | |
-| `-model` | Ollama model used for translation | `hf.co/blackcloud1199/qwen-translation-vi` |
+| `-model` | Ollama model used for translation. The default, Tencent's [Hy-MT2 1.8B](https://github.com/Tencent-Hunyuan/Hy-MT2), is made only for translation (33 languages, ~1.1 GB). Any other Ollama model works too, e.g. `translategemma` for 55 languages. | `hf.co/tencent/Hy-MT2-1.8B-GGUF:Q4_K_M` |
 | `-translate-cpu` | Run the translation model on the CPU only, which keeps the GPU free | off |
 | `-log` | Path to CS2 `console.log` | auto-detect |
 | `-setup` | Install and download everything, then exit | |

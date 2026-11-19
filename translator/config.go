@@ -9,8 +9,11 @@ import (
 )
 
 const (
-	DefaultOllamaPort  = 11434
-	DefaultOllamaModel = "hf.co/blackcloud1199/qwen-translation-vi"
+	DefaultOllamaPort = 11434
+	// DefaultOllamaModel is Tencent's Hy-MT2 1.8B, a model made only for
+	// translation (33 languages, ~1.1 GB at Q4_K_M), small enough to run
+	// next to a game.
+	DefaultOllamaModel = "hf.co/tencent/Hy-MT2-1.8B-GGUF:Q4_K_M"
 )
 
 // OllamaHost is the base URL of the Ollama API, e.g. http://localhost:11434.

@@ -93,18 +93,7 @@ func (t *OllamaTranslator) TranslateWithContext(ctx context.Context, text string
 		return text, nil
 	}
 
-	var prompt string
-	if vc.ContextText != "" {
-		prompt = fmt.Sprintf(`Context from recent speech (last 10 seconds):
-%s
-
-Translate the following text to %s. Use the context above to understand the conversation topic and provide a more accurate translation. Output ONLY the translation, nothing else:
-
-%s`, vc.ContextText, t.targetLang, text)
-	} else {
-		prompt = fmt.Sprintf("Translate the following text to %s. Output ONLY the translation, nothing else:\n\n%s", t.targetLang, text)
-	}
-
+	prompt := t.prompt(text, vc.ContextText)
 	translation, err := t.generate(ctx, prompt)
 	if err != nil {
 		return "", err
@@ -113,6 +102,37 @@ Translate the following text to %s. Use the context above to understand the conv
 		return text, nil
 	}
 	return translation, nil
+}
+
+// isHyMT reports whether the model is one of Tencent's Hy-MT translation
+// models, which are trained on fixed prompts and sampling settings.
+func (t *OllamaTranslator) isHyMT() bool {
+	return strings.Contains(strings.ToLower(t.model), "hy-mt")
+}
+
+// prompt builds the translation prompt. Hy-MT models get the exact prompts
+// from their model card; other models get a generic instruction.
+func (t *OllamaTranslator) prompt(text, contextText string) string {
+	if t.isHyMT() {
+		switch {
+		case contextText != "":
+			return fmt.Sprintf("%s\n参考上面的信息，把下面的文本翻译成%s，注意不需要翻译上文，也不要额外解释：\n%s",
+				contextText, t.targetLang, text)
+		case LanguageCode(t.targetLang) == "zh":
+			return fmt.Sprintf("将以下文本翻译为%s，注意只需要输出翻译后的结果，不要额外解释：\n\n%s", t.targetLang, text)
+		default:
+			return fmt.Sprintf("Translate the following segment into %s, without additional explanation.\n\n%s", t.targetLang, text)
+		}
+	}
+	if contextText != "" {
+		return fmt.Sprintf(`Context from recent speech (last 10 seconds):
+%s
+
+Translate the following text to %s. Use the context above to understand the conversation topic and provide a more accurate translation. Output ONLY the translation, nothing else:
+
+%s`, contextText, t.targetLang, text)
+	}
+	return fmt.Sprintf("Translate the following text to %s. Output ONLY the translation, nothing else:\n\n%s", t.targetLang, text)
 }
 
 // Preload loads the model into memory and runs one tiny translation, so the
@@ -152,6 +172,10 @@ func (t *OllamaTranslator) load(ctx context.Context) error {
 
 func (t *OllamaTranslator) options() map[string]any {
 	options := map[string]any{"temperature": 0.3}
+	if t.isHyMT() {
+		// sampling settings recommended on the Hy-MT2 1.8B/7B model cards
+		options = map[string]any{"temperature": 0.7, "top_p": 0.6, "top_k": 20, "repeat_penalty": 1.05}
+	}
 	if t.opts.CPUOnly {
 		options["num_gpu"] = 0
 	}
@@ -202,7 +226,16 @@ func (t *OllamaTranslator) request(ctx context.Context, client *http.Client, pro
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("ollama API returned status %d", resp.StatusCode)
 	}
-	return strings.TrimSpace(out.Response), nil
+	return cleanOutput(out.Response), nil
+}
+
+// cleanOutput drops a reasoning block (<think>...</think>) that some models
+// emit before the answer, and surrounding whitespace.
+func cleanOutput(s string) string {
+	if i := strings.LastIndex(s, "</think>"); i >= 0 {
+		s = s[i+len("</think>"):]
+	}
+	return strings.TrimSpace(s)
 }
 
 // Close unloads the model so its memory is freed when the tool exits.
