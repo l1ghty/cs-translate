@@ -60,6 +60,9 @@ func fakeUV(t *testing.T, body string) string {
 func TestStartReportsProgressAndJobs(t *testing.T) {
 	uv := fakeUV(t, `
 echo "Downloading numpy (15.0MiB)" >&2
+# Like real uv: install output comes well before Python starts. stdout and
+# stderr are read concurrently, so without a pause the order is a coin toss.
+sleep 0.3
 echo '{"event":"status","message":"Downloading Whisper model"}'
 echo '{"event":"progress","message":"Downloading Whisper model","done":50,"total":100,"unit":"B"}'
 echo "[speech] loading" >&2
