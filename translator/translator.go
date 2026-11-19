@@ -38,6 +38,7 @@ type ollamaRequest struct {
 	Model     string         `json:"model"`
 	Prompt    string         `json:"prompt"`
 	Stream    bool           `json:"stream"`
+	Raw       bool           `json:"raw,omitempty"`
 	KeepAlive string         `json:"keep_alive,omitempty"`
 	Options   map[string]any `json:"options,omitempty"`
 }
@@ -57,6 +58,24 @@ type VoiceContext struct {
 // and a slow translation. KeepWarm renews it while the tool runs; if the tool
 // dies without unloading the model, Ollama frees it after this time.
 const keepAlive = "30m"
+
+// Hy-MT chat format (llama.cpp's "hunyuan-dense" template). Ollama doesn't
+// apply it to these GGUFs by itself, and without it the model never sees the
+// end of its turn: answers run on until a limit, and translations take ages.
+const (
+	hyUser      = "<｜hy_User｜>"
+	hyAssistant = "<｜hy_Assistant｜>"
+	hyEndOfTurn = "<｜hy_place▁holder▁no▁2｜>"
+	hyEnd       = "<｜hy_place▁holder▁no▁8｜>"
+)
+
+// maxAnswerTokens caps every answer. A translated chat line or voice clip
+// is far shorter; the cap only stops a model that runs on.
+const maxAnswerTokens = 256
+
+// retiredModels are former defaults. If one is still loaded when the tool
+// starts (e.g. after an unclean exit), it is unloaded to free its memory.
+var retiredModels = []string{"hf.co/blackcloud1199/qwen-translation-vi"}
 
 // keepWarmEvery renews keepAlive well before it runs out.
 const keepWarmEvery = 10 * time.Minute
@@ -140,11 +159,42 @@ Translate the following text to %s. Use the context above to understand the conv
 // model to load. Loading can take from a second to a few minutes (large
 // model, slow disk), so this should be called at startup.
 func (t *OllamaTranslator) Preload(ctx context.Context) error {
+	t.unloadRetired(ctx)
 	if err := t.load(ctx); err != nil {
 		return err
 	}
 	_, err := t.Translate(ctx, "Good luck, have fun!") // warms up prompt processing
 	return err
+}
+
+// unloadRetired frees the memory of a former default model that is still
+// loaded in Ollama, so it doesn't compete with the current one.
+func (t *OllamaTranslator) unloadRetired(ctx context.Context) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.baseURL+"/api/ps", nil)
+	if err != nil {
+		return
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	var ps struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&ps) != nil {
+		return
+	}
+	for _, m := range ps.Models {
+		for _, old := range retiredModels {
+			name := strings.ToLower(m.Name)
+			if !strings.EqualFold(old, t.model) && (name == old || strings.HasPrefix(name, old+":")) {
+				unload(t.baseURL, m.Name)
+			}
+		}
+	}
 }
 
 // KeepWarm keeps the model loaded until ctx is done, so translations stay
@@ -171,10 +221,11 @@ func (t *OllamaTranslator) load(ctx context.Context) error {
 }
 
 func (t *OllamaTranslator) options() map[string]any {
-	options := map[string]any{"temperature": 0.3}
+	options := map[string]any{"temperature": 0.3, "num_predict": maxAnswerTokens}
 	if t.isHyMT() {
 		// sampling settings recommended on the Hy-MT2 1.8B/7B model cards
-		options = map[string]any{"temperature": 0.7, "top_p": 0.6, "top_k": 20, "repeat_penalty": 1.05}
+		options = map[string]any{"temperature": 0.7, "top_p": 0.6, "top_k": 20, "repeat_penalty": 1.05,
+			"num_predict": maxAnswerTokens, "stop": []string{hyEndOfTurn, hyEnd, hyUser}}
 	}
 	if t.opts.CPUOnly {
 		options["num_gpu"] = 0
@@ -190,12 +241,13 @@ func (t *OllamaTranslator) generate(ctx context.Context, prompt string) (string,
 }
 
 func (t *OllamaTranslator) request(ctx context.Context, client *http.Client, prompt string) (string, error) {
-	body, err := json.Marshal(ollamaRequest{
-		Model:     t.model,
-		Prompt:    prompt,
-		KeepAlive: keepAlive,
-		Options:   t.options(),
-	})
+	r := ollamaRequest{Model: t.model, Prompt: prompt, KeepAlive: keepAlive, Options: t.options()}
+	if prompt != "" && t.isHyMT() {
+		// send the prompt already in the model's chat format
+		r.Raw = true
+		r.Prompt = hyUser + prompt + hyAssistant
+	}
+	body, err := json.Marshal(r)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
@@ -240,15 +292,20 @@ func cleanOutput(s string) string {
 
 // Close unloads the model so its memory is freed when the tool exits.
 func (t *OllamaTranslator) Close() error {
-	body, _ := json.Marshal(map[string]any{"model": t.model, "keep_alive": 0})
-	req, err := http.NewRequest(http.MethodPost, t.baseURL+"/api/generate", bytes.NewReader(body))
+	unload(t.baseURL, t.model)
+	return nil
+}
+
+// unload asks Ollama to free a model's memory right away.
+func unload(baseURL, model string) {
+	body, _ := json.Marshal(map[string]any{"model": model, "keep_alive": 0})
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/generate", bytes.NewReader(body))
 	if err != nil {
-		return nil
+		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: 5 * time.Second}
 	if resp, err := client.Do(req); err == nil {
 		resp.Body.Close()
 	}
-	return nil
 }
