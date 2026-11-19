@@ -47,6 +47,9 @@ type Config struct {
 	AudioDevice string // capture device name/substring; "" = what you hear (loopback)
 	Live        bool   // continuously transcribe speech; otherwise only on Capture()
 	BufferSecs  int    // seconds of audio kept in memory for Capture()
+	// MaxSpeechSecs (live mode) transcribes an utterance once it is this
+	// long, even if the speaker hasn't paused yet; 0 = the worker's default.
+	MaxSpeechSecs int
 
 	// Progress, if set, is called with what the worker is doing while it
 	// starts: installing packages, downloading and loading the model.
@@ -212,6 +215,9 @@ func (c Config) command(ctx context.Context, extra ...string) (*exec.Cmd, error)
 	}
 	if c.Live {
 		args = append(args, "--live")
+		if c.MaxSpeechSecs > 0 {
+			args = append(args, "--max-speech-seconds", strconv.Itoa(c.MaxSpeechSecs))
+		}
 	}
 	args = append(args, extra...)
 

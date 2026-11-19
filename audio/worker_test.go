@@ -138,3 +138,21 @@ exit 2
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestCommandPassesVoiceInterval(t *testing.T) {
+	has := func(c Config) bool {
+		cmd, err := c.command(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Contains(strings.Join(cmd.Args, " "), "--max-speech-seconds 7")
+	}
+	c := Config{UV: "uv", DataDir: t.TempDir(), Model: "tiny", MaxSpeechSecs: 7}
+	if has(c) {
+		t.Error("interval passed although live mode is off")
+	}
+	c.Live = true
+	if !has(c) {
+		t.Error("interval not passed in live mode")
+	}
+}

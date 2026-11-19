@@ -37,6 +37,9 @@ func SetupOllama(scanner *bufio.Scanner, model string) error {
 			if err := installOllama(scanner); err != nil {
 				return err
 			}
+			// The installer opens Ollama's app window when it is done; keep
+			// it in the tray so it doesn't cover this window or the game.
+			hideOllamaWindow(30 * time.Second)
 			bin = findOllama()
 			// The installers start Ollama's tray app, which brings up the
 			// server by itself; give it a moment instead of racing it.

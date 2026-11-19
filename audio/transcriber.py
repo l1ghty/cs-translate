@@ -596,6 +596,8 @@ def main():
     ap.add_argument("--audio-device", default="")
     ap.add_argument("--live", action="store_true", help="continuously transcribe detected speech")
     ap.add_argument("--buffer-seconds", type=float, default=30.0)
+    ap.add_argument("--max-speech-seconds", type=float, default=12.0,
+                    help="live mode: transcribe after this much continuous speech even without a pause")
     ap.add_argument("--models-dir", default="")
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--prepare", action="store_true", help="download model, then exit")
@@ -647,7 +649,7 @@ def main():
                 break
         jobs.put(("live", audio))
 
-    segmenter = VadSegmenter(np, on_utterance) if args.live else None
+    segmenter = VadSegmenter(np, on_utterance, max_speech_s=max(args.max_speech_seconds, 1.0)) if args.live else None
 
     if sc is not None:
         threading.Thread(target=capture_loop, args=(sc, np, args, ring, segmenter, stop), daemon=True).start()

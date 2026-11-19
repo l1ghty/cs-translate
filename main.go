@@ -38,6 +38,7 @@ func main() {
 	whisperDevice := flag.String("whisper-device", "cpu", "Run speech recognition on 'cpu' (recommended while gaming) or 'cuda' (NVIDIA GPU)")
 	whisperThreads := flag.Int("whisper-threads", 0, "CPU threads for speech recognition (0 = auto, leaves most cores to the game)")
 	voiceLang := flag.String("voice-lang", "", "Language(s) spoken in voice chat: one code (ru) or a list (ru,en,de) to keep detection within them (default: auto-detect)")
+	voiceInterval := flag.Int("voice-interval", 10, "Live voice: transcribe after this many seconds of speech even if the speaker hasn't paused yet")
 	translateCPU := flag.Bool("translate-cpu", false, "Run the translation model on the CPU only, keeping the GPU free for the game")
 	setupOnly := flag.Bool("setup", false, "Install and download everything needed, then exit")
 	assumeYes := flag.Bool("yes", false, "Answer 'yes' to all setup questions (unattended install)")
@@ -53,6 +54,8 @@ func main() {
 		Language:    *voiceLang,
 		AudioDevice: *audioDevice,
 		BufferSecs:  captureSeconds * 2,
+
+		MaxSpeechSecs: max(*voiceInterval, 1),
 	}
 
 	if *listDevices {
@@ -64,8 +67,10 @@ func main() {
 		return
 	}
 
-	isEchoMode := selectMode(scanner) == "2"
-	if isEchoMode {
+	mode := selectMode(scanner, speechCfg.MaxSpeechSecs)
+	isEchoMode := mode == modeEcho
+	needsVoice := mode != modeCS2 // modes 2 and 3 are about voice
+	if needsVoice {
 		*useVoice = true
 	} else if !*useVoice {
 		*useVoice = promptVoiceEnable(scanner)
@@ -101,7 +106,7 @@ func main() {
 		return
 	}
 	if err != nil {
-		if isEchoMode {
+		if needsVoice {
 			log.Fatalf("Voice transcription unavailable: %v", err)
 		}
 		log.Printf("Warning: voice transcription disabled: %v", err)
@@ -112,9 +117,12 @@ func main() {
 	go tr.KeepWarm(ctx) // stay loaded so translations are instant even after quiet periods
 
 	s := newSession(ctx, tr, worker)
-	if isEchoMode {
+	switch mode {
+	case modeEcho:
 		runEchoMode(ctx, scanner, s, *logPath)
-	} else {
+	case modeAuto:
+		runAutoMode(ctx, s, *logPath, speechCfg.MaxSpeechSecs)
+	default:
 		runCS2Mode(ctx, scanner, s, *logPath)
 	}
 	s.busy.stop()
@@ -258,6 +266,41 @@ func runEchoMode(ctx context.Context, scanner *bufio.Scanner, s *session, logPat
 			s.capture("F9")
 		case <-enter:
 			s.capture("Enter")
+		case t, ok := <-s.worker.Transcripts():
+			if !ok {
+				log.Println("Speech worker stopped unexpectedly.")
+				return
+			}
+			s.transcript(t)
+		}
+	}
+}
+
+// runAutoMode transcribes and translates voice on its own: the speech worker
+// hands over each utterance as soon as the speaker pauses, or once it has
+// gone on for the voice interval. CS2 chat is translated too, if found.
+func runAutoMode(ctx context.Context, s *session, logPath string, interval int) {
+	fmt.Println("\n=== Auto Voice Mode Started ===")
+	fmt.Println("Listening to system audio + monitoring the CS2 console.")
+	fmt.Printf("Voice is translated when a sentence ends, or after %d seconds of speech.\n", interval)
+	fmt.Println("Press Ctrl+C to exit.")
+
+	var logLines chan *tail.Line
+	if mon := openLogMonitor(ctx, logPath, false); mon != nil {
+		defer mon.Stop()
+		logLines = mon.Lines()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case line, ok := <-logLines:
+			if !ok {
+				logLines = nil
+				continue
+			}
+			s.chatLine(line)
 		case t, ok := <-s.worker.Transcripts():
 			if !ok {
 				log.Println("Speech worker stopped unexpectedly.")
