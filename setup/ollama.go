@@ -280,7 +280,10 @@ func hasModel(base, model string) bool {
 		return false
 	}
 	for _, m := range tags.Models {
-		if m.Name == model || strings.TrimSuffix(m.Name, ":latest") == model || strings.HasPrefix(m.Name, model+":") {
+		// Ollama may report hf.co names in a different letter case
+		name := strings.ToLower(m.Name)
+		want := strings.ToLower(model)
+		if name == want || strings.TrimSuffix(name, ":latest") == want || strings.HasPrefix(name, want+":") {
 			return true
 		}
 	}
