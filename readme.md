@@ -14,7 +14,7 @@ It is built to stay out of your game's way, even on weaker PCs. Setup is automat
 
 | Component | What happens |
 |-----------|--------------|
-| **Ollama** (translation) | Detected if already installed. Otherwise it is installed natively without any clicks (`winget` on Windows, or the official installer in silent mode when winget is missing; `brew` on macOS; the official script on Linux) and the translation model is downloaded. |
+| **Ollama** (translation) | Detected if already installed. Otherwise it is installed natively without any clicks (`winget` on Windows, or the official installer in silent mode when winget is missing; `brew` on macOS; the official script on Linux) and the translation model is downloaded. On Windows, the Ollama window the installer opens is hidden right away; Ollama keeps running in the tray. |
 | **Speech engine** (voice) | A private copy of [uv](https://docs.astral.sh/uv/) (~20 MB, checksum-verified) is downloaded. uv installs its own Python plus faster-whisper. No system Python, admin rights, or PATH changes are needed. |
 | **Whisper model** | Downloaded once. The size is chosen to match your PC (see [Performance](#performance)). |
 
@@ -51,6 +51,7 @@ You then choose a mode:
 
 1. **In-game translate:** translates console chat. You can also turn on **live** voice transcription, which transcribes everything that is said.
 2. **Echo:** translates chat, and when you press **F9** (or **Enter**) it transcribes and translates the **last 15 seconds** of audio. Each utterance in that window is recognized separately, so mixed languages work. This is the lightest option, because speech recognition does nothing until you press the key.
+3. **Auto voice:** translates chat, and transcribes and translates voice **automatically**. Each sentence is sent as soon as the speaker pauses, or after **10 seconds** of non-stop speech (`-voice-interval`), whichever comes first. No key to press, so it costs more CPU than echo mode while people talk.
 
 CS2 must be started with the `-condebug` launch option so that it writes `console.log`. The tool checks for this and offers to open the Steam settings for you. The log file is found automatically in every Steam library, including libraries on other drives and Flatpak Steam.
 
@@ -60,6 +61,7 @@ CS2 must be started with the `-condebug` launch option so that it writes `consol
 |------|-------------|---------|
 | `-lang` | Target language for translation | `English` |
 | `-voice` | Enable live voice transcription without asking | off |
+| `-voice-interval` | Live voice (modes 1 and 3): transcribe after this many seconds of speech even if the speaker hasn't paused yet | `10` |
 | `-voice-lang` | Language spoken in voice chat. One code (`ru`) skips detection entirely. A list (`ru,en,de`) keeps detection within those languages, which avoids misdetected short clips. | auto-detect |
 | `-whisper-model` | `auto`, `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, or `distil-large-v3.5` (English only) | `auto` |
 | `-whisper-device` | `cpu`, or `cuda` for an NVIDIA GPU (see [Performance](#performance)) | `cpu` |

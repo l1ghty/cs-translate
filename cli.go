@@ -66,17 +66,29 @@ func runSetup(scanner *bufio.Scanner, ollamaModel string, cfg audio.Config) {
 	fmt.Printf("✔ Setup complete. Data is stored in %s\n", env.DataDir)
 }
 
-func selectMode(scanner *bufio.Scanner) string {
+// Modes offered at startup.
+const (
+	modeCS2  = "1"
+	modeEcho = "2"
+	modeAuto = "3"
+)
+
+func selectMode(scanner *bufio.Scanner, voiceInterval int) string {
 	fmt.Println("Select Mode:")
 	fmt.Println("1. CS2 In-Game Translate (console chat, optional live voice transcription)")
 	fmt.Println("2. Echo: chat translation + press F9 to transcribe and translate the last 15 seconds")
 	fmt.Println("   of voice (lightest option: speech recognition only runs when you press F9)")
+	fmt.Println("3. Auto voice: chat translation + voice is transcribed and translated automatically,")
+	fmt.Printf("   each time a sentence ends or after %d seconds of speech, whichever comes first\n", voiceInterval)
 	fmt.Print("Enter choice [1]: ")
 
-	if scanner.Scan() && strings.TrimSpace(scanner.Text()) == "2" {
-		return "2"
+	if scanner.Scan() {
+		switch choice := strings.TrimSpace(scanner.Text()); choice {
+		case modeEcho, modeAuto:
+			return choice
+		}
 	}
-	return "1"
+	return modeCS2
 }
 
 func promptVoiceEnable(scanner *bufio.Scanner) bool {
