@@ -14,6 +14,10 @@ func TestPreloadLoadsThenWarmsUpWithSameOptions(t *testing.T) {
 	var mu sync.Mutex
 	var reqs []ollamaRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/generate" {
+			json.NewEncoder(w).Encode(map[string]any{"models": []any{}})
+			return
+		}
 		var req ollamaRequest
 		json.NewDecoder(r.Body).Decode(&req)
 		mu.Lock()
@@ -84,5 +88,76 @@ func TestCleanOutputDropsThinking(t *testing.T) {
 		if got := cleanOutput(in); got != want {
 			t.Errorf("cleanOutput(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// fakeOllama records /api/generate requests and reports loaded models on /api/ps.
+func fakeOllama(t *testing.T, loaded ...string) (*httptest.Server, func() []ollamaRequest) {
+	var mu sync.Mutex
+	var reqs []ollamaRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/ps" {
+			var models []map[string]string
+			for _, m := range loaded {
+				models = append(models, map[string]string{"name": m})
+			}
+			json.NewEncoder(w).Encode(map[string]any{"models": models})
+			return
+		}
+		var req ollamaRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		reqs = append(reqs, req)
+		mu.Unlock()
+		json.NewEncoder(w).Encode(ollamaResponse{Response: "ok"})
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() []ollamaRequest {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]ollamaRequest(nil), reqs...)
+	}
+}
+
+func TestHyMTUsesRawChatFormatAndStops(t *testing.T) {
+	srv, reqs := fakeOllama(t)
+	tr, _ := NewOllamaTranslator(context.Background(), DefaultOllamaModel, "English", Options{})
+	tr.baseURL = srv.URL
+	if _, err := tr.Translate(context.Background(), "привет"); err != nil {
+		t.Fatal(err)
+	}
+	r := reqs()[0]
+	want := "<｜hy_User｜>Translate the following segment into English, without additional explanation.\n\nпривет<｜hy_Assistant｜>"
+	if !r.Raw || r.Prompt != want {
+		t.Errorf("raw=%v prompt=%q", r.Raw, r.Prompt)
+	}
+	stops, _ := r.Options["stop"].([]any)
+	if len(stops) == 0 || stops[0] != "<｜hy_place▁holder▁no▁2｜>" || r.Options["num_predict"] != float64(maxAnswerTokens) {
+		t.Errorf("options = %v", r.Options)
+	}
+
+	other, _ := NewOllamaTranslator(context.Background(), "translategemma:4b", "English", Options{})
+	other.baseURL = srv.URL
+	other.Translate(context.Background(), "hola")
+	if r := reqs()[1]; r.Raw || strings.Contains(r.Prompt, "hy_User") {
+		t.Errorf("other models must use Ollama's template: %+v", r)
+	}
+}
+
+func TestPreloadUnloadsRetiredDefault(t *testing.T) {
+	srv, reqs := fakeOllama(t, "hf.co/blackcloud1199/qwen-translation-vi:latest", "llama3:8b")
+	tr, _ := NewOllamaTranslator(context.Background(), DefaultOllamaModel, "English", Options{})
+	tr.baseURL = srv.URL
+	if err := tr.Preload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var unloaded []string
+	for _, r := range reqs() {
+		if r.Model != DefaultOllamaModel {
+			unloaded = append(unloaded, r.Model)
+		}
+	}
+	if len(unloaded) != 1 || unloaded[0] != "hf.co/blackcloud1199/qwen-translation-vi:latest" {
+		t.Errorf("unloaded %v, want only the retired default", unloaded)
 	}
 }
