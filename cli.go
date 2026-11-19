@@ -5,6 +5,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,22 +76,94 @@ const (
 	modeAuto = "3"
 )
 
-func selectMode(scanner *bufio.Scanner, voiceInterval int) string {
-	fmt.Println("Select Mode:")
-	fmt.Println("1. CS2 In-Game Translate (console chat, optional live voice transcription)")
-	fmt.Println("2. Echo: chat translation + press F9 to transcribe and translate the last 15 seconds")
-	fmt.Println("   of voice (lightest option: speech recognition only runs when you press F9)")
-	fmt.Println("3. Auto voice: chat translation + voice is transcribed and translated automatically,")
-	fmt.Printf("   each time a sentence ends or after %d seconds of speech, whichever comes first\n", voiceInterval)
-	fmt.Print("Enter choice [1]: ")
+// selectMode shows the start menu until a mode is picked. Option 0 changes
+// the target language (saved for next time); the result is returned with it.
+func selectMode(scanner *bufio.Scanner, voiceInterval int, lang string) (string, string) {
+	for {
+		fmt.Println("Select Mode:")
+		fmt.Printf("0. Change target language (currently: %s)\n", lang)
+		fmt.Println("1. CS2 In-Game Translate (console chat, optional live voice transcription)")
+		fmt.Println("2. Echo: chat translation + press F9 to transcribe and translate the last 15 seconds")
+		fmt.Println("   of voice (lightest option: speech recognition only runs when you press F9)")
+		fmt.Println("3. Auto voice: chat translation + voice is transcribed and translated automatically,")
+		fmt.Printf("   each time a sentence ends or after %d seconds of speech, whichever comes first\n", voiceInterval)
+		fmt.Print("Enter choice [1]: ")
 
-	if scanner.Scan() {
+		if !scanner.Scan() {
+			return modeCS2, lang
+		}
 		switch choice := strings.TrimSpace(scanner.Text()); choice {
+		case "0":
+			lang = selectLanguage(scanner, lang)
+			fmt.Println()
 		case modeEcho, modeAuto:
-			return choice
+			return choice, lang
+		default:
+			return modeCS2, lang
 		}
 	}
-	return modeCS2
+}
+
+// commonLanguages are the most used languages on Steam.
+var commonLanguages = []string{"English", "Chinese", "Russian", "Spanish", "Portuguese"}
+
+// selectLanguage asks for a target language and saves it for next time.
+func selectLanguage(scanner *bufio.Scanner, current string) string {
+	fmt.Println("\nTranslate into:")
+	for i, l := range commonLanguages {
+		fmt.Printf("%d. %s\n", i+1, l)
+	}
+	fmt.Printf("Enter a number or another language name [keep %s]: ", current)
+	if !scanner.Scan() {
+		return current
+	}
+	in := strings.TrimSpace(scanner.Text())
+	lang := current
+	if n, err := strconv.Atoi(in); err == nil {
+		if n < 1 || n > len(commonLanguages) {
+			fmt.Println("Unknown choice, keeping " + current)
+			return current
+		}
+		lang = commonLanguages[n-1]
+	} else if in != "" {
+		r := []rune(in)
+		lang = strings.ToUpper(string(r[0])) + string(r[1:])
+	}
+	if err := saveTargetLanguage(lang); err != nil {
+		log.Printf("Could not save the target language: %v", err)
+	}
+	fmt.Printf("✔ Target language: %s\n", lang)
+	return lang
+}
+
+// The chosen target language is kept in the app's data folder, so it
+// survives restarts. An explicit -lang flag always wins.
+func targetLanguageFile() (string, error) {
+	dir, err := setup.AppDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "target-language"), nil
+}
+
+func savedTargetLanguage() string {
+	path, err := targetLanguageFile()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func saveTargetLanguage(lang string) error {
+	path, err := targetLanguageFile()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(lang+"\n"), 0o644)
 }
 
 func promptVoiceEnable(scanner *bufio.Scanner) bool {

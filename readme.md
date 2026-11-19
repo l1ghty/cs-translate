@@ -51,6 +51,7 @@ cs-translate.exe -lang Spanish      # Windows
 
 You then choose a mode:
 
+0. **Change target language:** pick the language to translate into: English, Chinese, Russian, Spanish, Portuguese (the most used languages on Steam), or type any other language name. Your choice is remembered for the next start.
 1. **In-game translate:** translates console chat. You can also turn on **live** voice transcription, which transcribes everything that is said.
 2. **Echo:** translates chat, and when you press **F9** (or **Enter**) it transcribes and translates the **last 15 seconds** of audio. Each utterance in that window is recognized separately, so mixed languages work. This is the lightest option, because speech recognition does nothing until you press the key.
 3. **Auto voice:** translates chat, and transcribes and translates voice **automatically**. Each sentence is sent as soon as the speaker pauses, or after **10 seconds** of non-stop speech (`-voice-interval`), whichever comes first. No key to press, so it costs more CPU than echo mode while people talk.
@@ -61,7 +62,7 @@ CS2 must be started with the `-condebug` launch option so that it writes `consol
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-lang` | Target language for translation | `English` |
+| `-lang` | Target language for translation. Overrides the language saved with menu option 0. | `English` |
 | `-voice` | Enable live voice transcription without asking | off |
 | `-voice-interval` | Live voice (modes 1 and 3): transcribe after this many seconds of speech even if the speaker hasn't paused yet | `10` |
 | `-voice-lang` | Language spoken in voice chat. One code (`ru`) skips detection entirely. A list (`ru,en,de`) keeps detection within those languages, which avoids misdetected short clips. | auto-detect |
