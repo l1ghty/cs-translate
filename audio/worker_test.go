@@ -287,3 +287,42 @@ func TestCommandPassesAppAudio(t *testing.T) {
 		t.Error("--app-audio passed although a device was chosen")
 	}
 }
+
+func TestStreamingPartialsAndFlag(t *testing.T) {
+	uv := fakeUV(t, `
+echo '{"event":"ready","model":"tiny"}'
+echo '{"event":"partial","source":"live","text":"rush b","tentative":"we go","utterance":3,"language":"ru"}'
+while read cmd rest; do [ "$cmd" = quit ] && exit 0; done
+`)
+	w, err := Start(context.Background(), Config{UV: uv, DataDir: t.TempDir(), Model: "tiny", Live: true, Stream: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	select {
+	case tr := <-w.Transcripts():
+		if tr.Kind != KindPartial || tr.Text != "rush b" || tr.Tentative != "we go" || tr.Utterance != 3 {
+			t.Errorf("partial = %+v", tr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no partial")
+	}
+
+	args := func(c Config) string {
+		cmd, _ := c.command(context.Background())
+		return strings.Join(cmd.Args, " ")
+	}
+	base := Config{UV: "uv", DataDir: t.TempDir(), Model: "tiny"}
+	if strings.Contains(args(Config{UV: "uv", DataDir: base.DataDir, Model: "tiny", Stream: true}), "--stream") {
+		t.Error("--stream passed outside live mode")
+	}
+	live := base
+	live.Live = true
+	if strings.Contains(args(live), "--stream") {
+		t.Error("--stream passed although off")
+	}
+	live.Stream = true
+	if !strings.Contains(args(live), "--stream") {
+		t.Error("--stream not passed")
+	}
+}

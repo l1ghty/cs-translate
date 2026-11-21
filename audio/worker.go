@@ -59,6 +59,10 @@ type Config struct {
 	// transcribed. Before the program starts, or if that isn't possible, the
 	// worker records everything the user hears. Ignored with AudioDevice.
 	AppAudio string
+	// Stream (live mode) also reports what is being said while the speaker is
+	// still talking (KindPartial), using LocalAgreement-2. It decodes the
+	// speech again about once a second, so it costs extra CPU.
+	Stream bool
 	// Denoise cleans speech with RNNoise before it is transcribed (only the
 	// audio that is transcribed, so there is no load while nobody talks). It
 	// is skipped with a warning where RNNoise isn't available (macOS < 26).
@@ -87,9 +91,10 @@ type Progress struct {
 type Kind int
 
 const (
-	KindText  Kind = iota // recognised speech in Text
-	KindStart             // a transcription job started (Pieces utterances)
-	KindDone              // a transcription job finished (Found: any speech)
+	KindText    Kind = iota // recognised speech in Text
+	KindStart               // a transcription job started (Pieces utterances)
+	KindDone                // a transcription job finished (Found: any speech)
+	KindPartial             // streaming: speech still being spoken (Text confirmed, Tentative not yet)
 )
 
 // Transcript is a piece of recognised speech, or the start/end of a job.
@@ -97,6 +102,8 @@ type Transcript struct {
 	Kind                Kind    `json:"-"`
 	Source              string  `json:"source"` // "live" or "capture"
 	Text                string  `json:"text"`
+	Tentative           string  `json:"tentative"` // KindPartial: words that may still change
+	Utterance           int     `json:"utterance"` // live: which utterance (partials and its final share it)
 	Language            string  `json:"language"`
 	LanguageProbability float64 `json:"language_probability"`
 	AudioSeconds        float64 `json:"audio_seconds"`
@@ -242,6 +249,9 @@ func (c Config) command(ctx context.Context, extra ...string) (*exec.Cmd, error)
 	}
 	if c.Live {
 		args = append(args, "--live")
+		if c.Stream {
+			args = append(args, "--stream")
+		}
 		if c.MaxSpeechSecs > 0 {
 			args = append(args, "--max-speech-seconds", strconv.Itoa(c.MaxSpeechSecs))
 		}
@@ -467,6 +477,10 @@ func (w *Worker) read(events <-chan event, ready chan<- error) {
 		case "transcript":
 			t := ev.Transcript
 			t.Kind = KindText
+			w.transcripts <- t
+		case "partial":
+			t := ev.Transcript
+			t.Kind = KindPartial
 			w.transcripts <- t
 		case "job_done":
 			t := ev.Transcript

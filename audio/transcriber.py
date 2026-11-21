@@ -41,6 +41,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -277,12 +278,17 @@ class VadSegmenter:
     """Streaming Silero VAD that turns a continuous stream into utterances."""
 
     def __init__(self, np, on_utterance, threshold=0.5, min_silence_s=0.3,
-                 min_speech_s=0.25, max_speech_s=5.0, pad_s=0.2, overlap_s=0.2):
+                 min_speech_s=0.25, max_speech_s=5.0, pad_s=0.2, overlap_s=0.2,
+                 on_partial=None, partial_every_s=1.0):
         from faster_whisper.vad import get_vad_model
 
         self.np = np
         self.session = get_vad_model().session  # single-threaded ONNX session
-        self.on_utterance = on_utterance
+        self.on_utterance = on_utterance  # (audio, utterance id)
+        self.on_partial = on_partial      # (audio so far, utterance id), about every partial_every_s of speech
+        self.partial_every = int(partial_every_s * SAMPLE_RATE)
+        self.last_partial = 0
+        self.utt = 0                      # id of the current utterance
         self.threshold = threshold
         self.neg_threshold = max(threshold - 0.15, 0.01)
         self.min_silence = int(min_silence_s * SAMPLE_RATE / VAD_FRAME)
@@ -323,8 +329,10 @@ class VadSegmenter:
                 self.preroll.pop(0)
             if p >= self.threshold:
                 self.active = True
+                self.utt += 1
                 self.speech = list(self.preroll)
                 self.speech_len = sum(len(f) for f in self.speech)
+                self.last_partial = self.speech_len
                 self.preroll = []
                 self.silence = 0
             return
@@ -340,6 +348,10 @@ class VadSegmenter:
             self._finish()
         elif self.speech_len >= self.max_speech:
             self._finish(keep_overlap=True)
+        elif (self.on_partial is not None and self.silence == 0
+              and self.speech_len - self.last_partial >= self.partial_every):
+            self.last_partial = self.speech_len
+            self.on_partial(self.np.concatenate(self.speech), self.utt)
 
     def _finish(self, keep_overlap=False):
         """Hand over the utterance. With keep_overlap the speaker is still
@@ -351,13 +363,17 @@ class VadSegmenter:
         frames = self.speech[: len(self.speech) - drop] if drop else self.speech
         audio = np.concatenate(frames) if frames else np.zeros(0, dtype=np.float32)
         voiced = self.speech_len - self.silence * VAD_FRAME
+        utt = self.utt
         tail = self.speech[-self.overlap_frames:] if keep_overlap else []
         self.active = keep_overlap
         self.speech = list(tail)
         self.speech_len = sum(len(f) for f in tail)
+        self.last_partial = self.speech_len
         self.silence = 0
+        if keep_overlap:
+            self.utt += 1  # the speaker goes on: the rest is a new utterance
         if voiced >= self.min_speech:
-            self.on_utterance(audio)
+            self.on_utterance(audio, utt)
 
 
 # --------------------------------------------------------------------------
@@ -920,17 +936,115 @@ def parse_languages(spec):
     return [l.strip().lower() for l in spec.split(",") if l.strip()]
 
 
-def asr_loop(model, args, jobs, np=None, rnnoise=None):
+class LocalAgreement2:
+    """LocalAgreement-2 for streaming recognition: Whisper is run again and
+    again on a growing utterance, and a word is *confirmed* once two passes in
+    a row agree on it (together with everything before it). The words after
+    the confirmed prefix are tentative and may still change."""
+
+    def __init__(self):
+        self.prev = []
+        self.confirmed = []
+
+    @staticmethod
+    def norm(word):
+        return re.sub(r"[\W_]+", "", word.lower())
+
+    def update(self, words):
+        """Feed the words of the latest pass; returns (confirmed, tentative)."""
+        n = 0
+        while n < min(len(self.prev), len(words)) and self.norm(self.prev[n]) == self.norm(words[n]):
+            n += 1
+        if n > len(self.confirmed):  # confirmed text only ever grows; shown words never change
+            self.confirmed += words[len(self.confirmed):n]
+        self.prev = list(words)
+        return list(self.confirmed), list(words[len(self.confirmed):])
+
+
+_CJK = re.compile("[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+
+
+def split_words(text):
+    """Words of a transcript; one token per character for Chinese/Japanese/Korean."""
+    if _CJK.search(text):
+        return [c for c in text if not c.isspace()]
+    return text.split()
+
+
+def join_words(words, text):
+    return ("" if _CJK.search(text) else " ").join(words)
+
+
+class PartialSlot:
+    """Holds the newest partial request only: while Whisper is busy, older
+    snapshots of the same speech are not worth decoding."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.item = None
+
+    def put(self, item):
+        with self.lock:
+            self.item = item
+
+    def take(self):
+        with self.lock:
+            item, self.item = self.item, None
+            return item
+
+    def peek(self):
+        with self.lock:
+            return self.item
+
+
+def asr_loop(model, args, jobs, np=None, rnnoise=None, partials=None):
+    """Transcribe queued utterances. With `partials` (streaming), the time
+    between jobs is used to decode the speech still being spoken, so the
+    host can show text before the sentence ends; final jobs always go first."""
     languages = parse_languages(args.language)
+    la, la_utt, last_shown = LocalAgreement2(), None, None
+    finished = 0           # utterances up to this id have been transcribed for good
+    next_partial_at = 0.0  # a partial pass takes at most half of the thread's time
+
+    def partial_pass():
+        nonlocal la, la_utt, last_shown, next_partial_at
+        if time.monotonic() < next_partial_at or partials.peek() is None:
+            return
+        audio, utt = partials.take()
+        if utt <= finished:
+            return  # the final transcription already ran
+        if utt != la_utt:
+            la, la_utt, last_shown = LocalAgreement2(), utt, None
+        text, language, probability, took = transcribe(model, languages, denoise(np, rnnoise, audio))
+        next_partial_at = time.monotonic() + took
+        confirmed, tentative = la.update(split_words(text))
+        shown = (tuple(confirmed), tuple(tentative))
+        if shown != last_shown and utt > finished:
+            last_shown = shown
+            emit("partial", source="live", text=join_words(confirmed, text), tentative=join_words(tentative, text),
+                 language=language, language_probability=round(probability, 3), utterance=utt,
+                 audio_seconds=round(len(audio) / SAMPLE_RATE, 2), processing_seconds=round(took, 2))
+
     while True:
-        source, audio = jobs.get()
+        try:
+            source, audio, utt = jobs.get(timeout=0.05) if partials is not None else jobs.get()
+        except queue.Empty:
+            try:
+                partial_pass()
+            except Exception as e:
+                emit("error", message=f"streaming transcription failed: {e}", fatal=False)
+            continue
         if source == "quit":
             return
+        if source == "live":
+            finished = max(finished, utt)
+            if la_utt == utt:
+                la, la_utt = LocalAgreement2(), None
         found = False
         try:
             audio = denoise(np, rnnoise, audio)
             pieces = split_speech(audio) if source == "capture" else [audio]
-            emit("job_start", source=source, pieces=len(pieces))
+            emit("job_start", source=source, pieces=len(pieces), utterance=utt)
             for piece in pieces:
                 if len(piece) < SAMPLE_RATE // 4:
                     continue
@@ -938,13 +1052,14 @@ def asr_loop(model, args, jobs, np=None, rnnoise=None):
                 if not text:
                     continue
                 found = True
-                emit("transcript", source=source, text=text,
+                emit("transcript", source=source, text=text, utterance=utt,
                      language=language, language_probability=round(probability, 3),
                      audio_seconds=round(len(piece) / SAMPLE_RATE, 2), processing_seconds=round(took, 2))
         except Exception as e:
             emit("error", message=f"transcription failed: {e}", fatal=False)
         finally:
-            emit("job_done", source=source, found=found)
+            emit("job_done", source=source, found=found, utterance=utt)
+
 
 
 # --------------------------------------------------------------------------
@@ -1088,6 +1203,8 @@ def main():
                     help="live mode: transcribe after this much continuous speech even without a pause")
     ap.add_argument("--app-audio", default="",
                     help="Windows: capture only this program's audio (e.g. cs2.exe) while it is running")
+    ap.add_argument("--stream", action="store_true",
+                    help="live mode: also report what is being said before the sentence ends (LocalAgreement-2)")
     ap.add_argument("--denoise", action="store_true", help="suppress noise (RNNoise) before voice detection")
     ap.add_argument("--nmt-langs", default="",
                     help="enable fast offline translation to English for these languages (comma-separated); "
@@ -1136,7 +1253,7 @@ def main():
     jobs = queue.Queue()
     ring = RingBuffer(np, max(args.buffer_seconds, 1.0))
 
-    def on_utterance(audio):
+    def on_utterance(audio, utt):
         # Never let a backlog build up: if Whisper can't keep up, drop the oldest speech.
         while jobs.qsize() >= 3:
             try:
@@ -1144,18 +1261,22 @@ def main():
                 emit("warning", message="transcription is falling behind, dropped an utterance")
             except queue.Empty:
                 break
-        jobs.put(("live", audio))
+        jobs.put(("live", audio, utt))
 
     rnnoise = load_rnnoise() if args.denoise else None
     if args.denoise and rnnoise is None:
         emit("warning", message="noise suppression is not available on this system; continuing without it")
 
-    segmenter = VadSegmenter(np, on_utterance, max_speech_s=max(args.max_speech_seconds, 1.0)) if args.live else None
+    partials = PartialSlot() if args.live and args.stream else None
+    segmenter = None
+    if args.live:
+        segmenter = VadSegmenter(np, on_utterance, max_speech_s=max(args.max_speech_seconds, 1.0),
+                                 on_partial=(lambda audio, utt: partials.put((audio, utt))) if partials else None)
 
     if sc is not None:
         threading.Thread(target=capture_loop, args=(sc, np, args, ring, segmenter, stop), daemon=True).start()
 
-    asr = threading.Thread(target=asr_loop, args=(model, args, jobs, np, rnnoise), daemon=True)
+    asr = threading.Thread(target=asr_loop, args=(model, args, jobs, np, rnnoise, partials), daemon=True)
     asr.start()
 
     nmt_jobs = None
@@ -1176,7 +1297,7 @@ def main():
             break
         if cmd[0] == "capture":
             seconds = float(cmd[1]) if len(cmd) > 1 else 15.0
-            jobs.put(("capture", ring.last(seconds)))
+            jobs.put(("capture", ring.last(seconds), 0))
         elif cmd[0] == "prompt":
             # "prompt <text>": vocabulary hint for Whisper (e.g. the map's callouts)
             set_prompt(line.strip()[len("prompt"):])
@@ -1198,7 +1319,7 @@ def main():
     stop.set()
     if nmt_jobs is not None:
         nmt_jobs.put(None)
-    jobs.put(("quit", None))
+    jobs.put(("quit", None, 0))
     asr.join(timeout=30)  # let queued work (e.g. a pending capture) finish
 
 

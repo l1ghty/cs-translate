@@ -41,6 +41,7 @@ func main() {
 	voiceLang := flag.String("voice-lang", "", "Language(s) spoken in voice chat: one code (ru) or a list (ru,en,de) to keep detection within them (default: auto-detect)")
 	voiceInterval := flag.Int("voice-interval", 5, "Live voice: transcribe after this many seconds of speech even if the speaker hasn't paused yet")
 	fastTranslate := flag.Bool("fast-translate", true, "Voice: translate short callouts to English with a small offline model (no LLM, no GPU); falls back to the LLM when unavailable")
+	voiceStream := flag.Bool("voice-stream", false, "Live voice: show what is being said while the speaker is still talking (uses extra CPU)")
 	appAudio := flag.String("app-audio", "cs2.exe", "Windows: record only this program's audio while it runs, so Discord/music aren't transcribed ('off' = everything you hear)")
 	denoise := flag.Bool("denoise", true, "Voice: suppress game noise (gunfire, ambience) with RNNoise before recognising speech")
 	translateCPU := flag.Bool("translate-cpu", false, "Run the translation model on the CPU only, keeping the GPU free for the game")
@@ -59,6 +60,7 @@ func main() {
 		AudioDevice: *audioDevice,
 		BufferSecs:  captureSeconds * 2,
 		Denoise:     *denoise,
+		Stream:      *voiceStream,
 		AppAudio:    *appAudio,
 
 		FastLanguages: fastLanguages(*voiceLang),
@@ -491,27 +493,84 @@ func (s *session) transcript(t audio.Transcript) {
 		if t.Source == "capture" && !t.Found {
 			ui.Println("No speech found in that audio.")
 		}
+	case audio.KindPartial:
+		if !ui.Interactive() {
+			return // a piped log would get a line per update
+		}
+		s.busy.update(func(b *busy) {
+			if t.Utterance >= b.hearingUtt {
+				b.hearing, b.hearingUtt = hearingText(t), t.Utterance
+			}
+		})
 	case audio.KindText:
+		s.clearHearing(t)
 		s.vt.printOriginal(t)
 		s.translate(func() { s.vt.printTranslation(s.ctx, t) })
 	}
+}
+
+// hearingText formats a partial for the status line: confirmed words, then
+// the tentative ones after a marker.
+func hearingText(t audio.Transcript) string {
+	if t.Tentative == "" {
+		return t.Text
+	}
+	if t.Text == "" {
+		return "… " + t.Tentative
+	}
+	return t.Text + " ▸ " + t.Tentative
+}
+
+// clearHearing drops the live text once the utterance it belongs to (or a
+// later one) has its final transcription.
+func (s *session) clearHearing(t audio.Transcript) {
+	if t.Source != "live" {
+		return
+	}
+	s.busy.update(func(b *busy) {
+		if t.Utterance >= b.hearingUtt {
+			b.hearing = ""
+		}
+	})
 }
 
 // busy shows what is running in the background on the status line.
 type busy struct {
 	mu          sync.Mutex
 	st          *ui.Status
-	captures    int // F9 captures waiting for or in transcription
-	clips       int // utterances in the capture being transcribed
-	live        int // live utterances being transcribed
-	translating int // translations queued or running
+	captures    int    // F9 captures waiting for or in transcription
+	clips       int    // utterances in the capture being transcribed
+	live        int    // live utterances being transcribed
+	translating int    // translations queued or running
+	hearing     string // streaming: text of the utterance being spoken
+	hearingUtt  int
 }
 
 func (b *busy) update(f func(*busy)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	f(b)
+	label := b.label()
+	if label == "" {
+		if b.st != nil {
+			b.st.Stop()
+			b.st = nil
+		}
+		return
+	}
+	if b.st == nil {
+		b.st = ui.Start(label)
+	} else {
+		b.st.Set(label)
+	}
+}
+
+// label describes what is running, for the status line ("" = nothing).
+func (b *busy) label() string {
 	var parts []string
+	if b.hearing != "" {
+		parts = append(parts, "Hearing: "+b.hearing)
+	}
 	if b.captures > 0 {
 		p := fmt.Sprintf("Transcribing the last %ds of voice", captureSeconds)
 		if b.clips > 1 {
@@ -532,23 +591,11 @@ func (b *busy) update(f func(*busy)) {
 		}
 		parts = append(parts, p)
 	}
-	if len(parts) == 0 {
-		if b.st != nil {
-			b.st.Stop()
-			b.st = nil
-		}
-		return
-	}
-	label := strings.Join(parts, " · ")
-	if b.st == nil {
-		b.st = ui.Start(label)
-	} else {
-		b.st.Set(label)
-	}
+	return strings.Join(parts, " · ")
 }
 
 func (b *busy) stop() {
-	b.update(func(b *busy) { b.captures, b.clips, b.live, b.translating = 0, 0, 0, 0 })
+	b.update(func(b *busy) { b.captures, b.clips, b.live, b.translating, b.hearing = 0, 0, 0, 0, "" })
 }
 
 func outputChat(name, text string, isDead bool, originalLine string) {
