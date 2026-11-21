@@ -13,6 +13,7 @@ import (
 
 	"github.com/micha/cs-ingame-translate/audio"
 	"github.com/micha/cs-ingame-translate/callouts"
+	"github.com/micha/cs-ingame-translate/overlay"
 	"github.com/micha/cs-ingame-translate/setup"
 	"github.com/micha/cs-ingame-translate/translator"
 	"github.com/micha/cs-ingame-translate/ui"
@@ -187,7 +188,8 @@ type voiceContextItem struct {
 // voiceTranslator translates speech, using the last few seconds of speech as context.
 type voiceTranslator struct {
 	tr         *translator.OllamaTranslator
-	worker     *audio.Worker // offline fast translation; may be nil
+	worker     *audio.Worker   // offline fast translation; may be nil
+	ov         *overlay.Server // web overlay; may be nil
 	targetCode string
 	history    []voiceContextItem
 }
@@ -277,6 +279,11 @@ func speakerStyle(n int) (tag, on, off string) {
 func (v *voiceTranslator) printTranslation(ctx context.Context, t audio.Transcript) {
 	start := time.Now()
 	translated, via, didTranslate := v.translateVia(ctx, t)
+	ev := overlay.Event{Type: "voice", Speaker: t.Speaker, Language: t.Language, Original: t.Text}
+	if didTranslate {
+		ev.Translation = translated
+	}
+	v.ov.Publish(ev) // also lines already in the target language, without a translation
 	if didTranslate {
 		tag := ""
 		if via != "" {

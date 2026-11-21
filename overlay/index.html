@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cs-translate</title>
+<style>
+  /* Options in the address: ?fade=5 (seconds a line stays), ?max=6 (lines), ?size=28 (px),
+     ?transparent=1 (no background, for OBS / overlay tools), ?top=1 (lines at the top) */
+  :root { --size: 28px; }
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body { background: #0b0d10; color: #f2f4f7; font: var(--size)/1.25 system-ui, "Segoe UI", sans-serif; }
+  body.transparent { background: transparent; }
+  #feed { position: fixed; left: 0; right: 0; bottom: 0; padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }
+  body.top #feed { top: 0; bottom: auto; }
+  .row { background: rgba(10, 12, 16, .72); border-radius: 8px; padding: 6px 12px; max-width: 100%; width: fit-content;
+         opacity: 1; transition: opacity .9s ease; overflow-wrap: anywhere; text-shadow: 0 1px 2px #000; }
+  body:not(.transparent) .row { background: #181c22; }
+  .row.out { opacity: 0; }
+  .who { font-weight: 700; margin-right: .4em; }
+  .orig { display: block; font-size: .62em; opacity: .7; margin-top: 2px; }
+  .hear { font-style: italic; opacity: .75; }
+  .tag { font-size: .6em; padding: 1px 6px; border-radius: 4px; margin-right: .5em; background: #333; vertical-align: middle; }
+  .dead { opacity: .8; }
+  #state { position: fixed; top: 6px; right: 8px; width: 10px; height: 10px; border-radius: 50%; background: #e5484d; opacity: .9; }
+  #state.ok { background: #30a46c; opacity: .35; }
+  body.transparent #state { display: none; }
+</style>
+</head>
+<body>
+<div id="feed"></div>
+<div id="state" title="connection"></div>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var fade = Math.max(1, parseFloat(q.get("fade")) || 5) * 1000;
+  var max = Math.max(1, parseInt(q.get("max"), 10) || 6);
+  if (q.get("size")) document.documentElement.style.setProperty("--size", Math.max(10, parseInt(q.get("size"), 10) || 28) + "px");
+  if (q.get("transparent")) document.body.classList.add("transparent");
+  if (q.get("top")) document.body.classList.add("top");
+  var feed = document.getElementById("feed"), state = document.getElementById("state");
+  // same colours as the terminal: cyan, yellow, magenta, red, blue, white
+  var speakerColors = ["#5ce1e6", "#ffd84d", "#ff6ad5", "#ff5d5d", "#6ea8ff", "#ffffff"];
+  var hearing = null, hearTimer = null;
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;   // text only: chat is untrusted
+    return e;
+  }
+  function expire(row, ms) {
+    setTimeout(function () { row.classList.add("out"); }, Math.max(0, ms - 900));
+    setTimeout(function () { row.remove(); }, Math.max(0, ms));
+  }
+  function trim() { while (feed.querySelectorAll(".row:not(.hear)").length > max) feed.querySelector(".row:not(.hear)").remove(); }
+
+  function clearHearing() { if (hearing) { hearing.remove(); hearing = null; } clearTimeout(hearTimer); }
+  function showHearing(e) {
+    if (!e.original) return clearHearing();
+    if (!hearing) { hearing = el("div", "row hear"); feed.appendChild(hearing); }
+    hearing.textContent = e.original;
+    clearTimeout(hearTimer);
+    hearTimer = setTimeout(clearHearing, 3000);        // the speaker stopped, or the final line replaced it
+  }
+
+  function add(e, age) {
+    var left = fade - age;
+    if (left <= 500) return;                            // too old to bother (e.g. replay after a reconnect)
+    var row = el("div", "row" + (e.dead ? " dead" : ""));
+    var who = el("span", "who");
+    if (e.type === "voice") {
+      if (e.speaker > 0) {
+        who.style.color = speakerColors[(e.speaker - 1) % speakerColors.length];
+        who.textContent = "P" + e.speaker;
+      } else { who.textContent = "🎙"; }
+    } else {
+      who.textContent = (e.dead ? "*DEAD* " : "") + (e.name || "?");
+      who.style.color = e.team === "CT" ? "#6ea8ff" : e.team === "T" ? "#ffb347" : "#f2f4f7";
+    }
+    row.appendChild(who);
+    var main = e.translation || e.original || "";
+    row.appendChild(document.createTextNode(main));
+    if (e.translation && e.original && e.original !== e.translation) row.appendChild(el("span", "orig", e.original));
+    if (e.type === "voice") clearHearing();
+    feed.appendChild(row);
+    if (hearing) feed.appendChild(hearing);             // live text stays at the bottom
+    trim();
+    expire(row, left);
+  }
+
+  function connect() {
+    var k = q.get("k");
+    var es = new EventSource("events" + (k ? "?k=" + encodeURIComponent(k) : ""));
+    es.onopen = function () { state.className = "ok"; };
+    es.onerror = function () { state.className = ""; };   // EventSource reconnects by itself
+    es.onmessage = function (m) {
+      var e; try { e = JSON.parse(m.data); } catch (_) { return; }
+      if (e.type === "hearing") showHearing(e); else add(e, e.age || 0);
+    };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

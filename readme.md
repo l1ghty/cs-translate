@@ -141,3 +141,20 @@ docker volume rm cs-translate-models
 - **Only the game's audio (Windows 10 20H1+ / 11):** while `cs2.exe` runs, only its audio is recorded (WASAPI Application Loopback), so Discord, Spotify or YouTube never reach speech recognition. It switches over by itself when the game starts and back to all system audio when it closes. If Windows can't do it, you get a warning and everything you hear is recorded as before. Change the program with `-app-audio notepad.exe`, or turn it off with `-app-audio off`. Choosing a device with `-audiodevice` also disables it.
 - **Live text while they speak (opt-in):** with `-voice-stream`, the speech engine re-listens to the sentence being spoken about once a second and shows it on the status line, with `▸` marking the words that may still change. A word counts as settled once two passes in a row agree on it (LocalAgreement-2). The translation is still made from the finished sentence. It costs extra CPU while people talk (bounded to half of the speech thread's time and always yielding to finished sentences), so it is off by default. It only shows in an interactive terminal.
 - **Speaker colours (opt-in, experimental):** with `-speakers`, each voice heard in a match gets a number and colour (`P1`, `P2`, ... up to 6), so you can see whether two callouts came from the same teammate. It uses a small voice fingerprint (average MFCCs, no neural network, negligible CPU), forgets the voices when a new map loads, and gives no tag to very short or unclear speech. **It is a rough guide, not identification.** On real multi-speaker recordings (not game audio) it judged 70% of consecutive utterance pairs correctly as same or different speaker, versus 58% for simply guessing "same speaker" every time. Similar voices are often merged, and game audio compression and noise may make it worse. Treat a colour as a hint.
+
+## Overlay: translations on a phone, second screen or OBS
+
+Start with `-overlay` and open `http://127.0.0.1:8765/` in any browser. Chat translations and voice lines (with the original below, speaker colour with `-speakers`, live text with `-voice-stream`) appear as a feed and **fade out after 5 seconds**. It works in a normal browser window on a second monitor, and as an OBS / overlay-tool "browser source".
+
+| Address option | Meaning | Default |
+| --- | --- | --- |
+| `?fade=8` | seconds a line stays | `5` |
+| `?max=4` | lines shown at once | `6` |
+| `?size=34` | text size in px | `28` |
+| `?transparent=1` | no background (for OBS / overlay tools); the connection dot is hidden | off |
+| `?top=1` | anchor the feed to the top of the window | bottom |
+
+- `-overlay-port` changes the port (default `8765`).
+- `-overlay-lan` also lets other devices on your network open it, e.g. a phone propped under the monitor. The printed address then contains a **secret key**; anyone on your network who has it can read your translations, and traffic is not encrypted. Without this flag it only listens on your own PC.
+- Chat from the game is shown as plain text only, never as HTML.
+- There is no built-in window drawn over the game. CS2 has to run in *borderless windowed* mode for any overlay tool to draw above it; in exclusive fullscreen use a second screen or phone.

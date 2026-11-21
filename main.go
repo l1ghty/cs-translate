@@ -18,6 +18,7 @@ import (
 	"github.com/micha/cs-ingame-translate/callouts"
 	"github.com/micha/cs-ingame-translate/hotkey"
 	"github.com/micha/cs-ingame-translate/monitor"
+	"github.com/micha/cs-ingame-translate/overlay"
 	"github.com/micha/cs-ingame-translate/parser"
 	"github.com/micha/cs-ingame-translate/setup"
 	"github.com/micha/cs-ingame-translate/translator"
@@ -43,6 +44,9 @@ func main() {
 	fastTranslate := flag.Bool("fast-translate", true, "Voice: translate short callouts to English with a small offline model (no LLM, no GPU); falls back to the LLM when unavailable")
 	voiceStream := flag.Bool("voice-stream", false, "Live voice: show what is being said while the speaker is still talking (uses extra CPU)")
 	speakers := flag.Bool("speakers", false, "Voice: give each voice a number and colour (P1, P2, ...) so you can tell speakers apart; a rough guide only")
+	overlayOn := flag.Bool("overlay", false, "Serve translations as a web page for a phone, second screen or OBS/overlay browser source (http://127.0.0.1:8765)")
+	overlayPort := flag.Int("overlay-port", 8765, "Port of the -overlay page")
+	overlayLAN := flag.Bool("overlay-lan", false, "Let other devices on your network open the overlay (a secret key is added to the address); implies -overlay")
 	appAudio := flag.String("app-audio", "cs2.exe", "Windows: record only this program's audio while it runs, so Discord/music aren't transcribed ('off' = everything you hear)")
 	denoise := flag.Bool("denoise", true, "Voice: suppress game noise (gunfire, ambience) with RNNoise before recognising speech")
 	translateCPU := flag.Bool("translate-cpu", false, "Run the translation model on the CPU only, keeping the GPU free for the game")
@@ -137,6 +141,11 @@ func main() {
 	go tr.KeepWarm(ctx) // stay loaded so translations are instant even after quiet periods
 
 	s := newSession(ctx, tr, worker)
+	if *overlayOn || *overlayLAN {
+		s.ov = startOverlay(ctx, *overlayPort, *overlayLAN)
+		s.vt.ov = s.ov
+		defer s.ov.Close()
+	}
 	switch mode {
 	case modeEcho:
 		runEchoMode(ctx, scanner, s, *logPath)
@@ -147,6 +156,24 @@ func main() {
 	}
 	s.busy.stop()
 	fmt.Println("\nStopping...")
+}
+
+// startOverlay starts the overlay server and prints where to open it. A
+// failure (port in use) only disables the overlay.
+func startOverlay(ctx context.Context, port int, lan bool) *overlay.Server {
+	ov, err := overlay.Start(ctx, overlay.Options{Port: port, LAN: lan})
+	if err != nil {
+		log.Printf("Overlay unavailable: %v", err)
+		return nil
+	}
+	fmt.Println("Overlay: open one of these (add ?transparent=1 for OBS, ?fade=8 to keep lines longer):")
+	for _, u := range ov.URLs() {
+		fmt.Println("  " + u)
+	}
+	if lan {
+		fmt.Println("  Anyone on your network with the key in the address can read your translations.")
+	}
+	return ov
 }
 
 // fastLanguages lists the spoken languages (-voice-lang) that get a fast
@@ -390,7 +417,8 @@ type session struct {
 	vt     *voiceTranslator
 	busy   *busy
 	jobs   chan func()
-	curMap string // last map seen in console.log
+	curMap string          // last map seen in console.log
+	ov     *overlay.Server // optional web overlay; nil = off
 }
 
 func newSession(ctx context.Context, tr *translator.OllamaTranslator, worker *audio.Worker) *session {
@@ -443,6 +471,8 @@ func (s *session) chatLine(line *tail.Line) {
 			translated = "[Translation Pending/Error]"
 		}
 		outputChat(msg.PlayerName, translated, msg.IsDead, msg.OriginalText)
+		s.ov.Publish(overlay.Event{Type: "chat", Name: msg.PlayerName, Team: msg.Team, Dead: msg.IsDead,
+			Original: msg.MessageContent, Translation: translated})
 	})
 }
 
@@ -497,6 +527,7 @@ func (s *session) transcript(t audio.Transcript) {
 			ui.Println("No speech found in that audio.")
 		}
 	case audio.KindPartial:
+		s.ov.Publish(overlay.Event{Type: "hearing", Original: strings.TrimSpace(t.Text + " " + t.Tentative), Speaker: t.Speaker})
 		if !ui.Interactive() {
 			return // a piped log would get a line per update
 		}
