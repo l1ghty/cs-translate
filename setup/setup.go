@@ -66,7 +66,7 @@ func missingComponents(ollamaModel string, useVoice bool) []string {
 		missing = append(missing, fmt.Sprintf("Translation model '%s' (one-time download, ~1-2 GB)", ollamaModel))
 	}
 	if useVoice && findUV() == "" {
-		missing = append(missing, "Speech engine: uv (~20 MB), Python, faster-whisper and a Whisper model")
+		missing = append(missing, "Speech engine: uv (~20 MB), Python, faster-whisper, a Whisper model and small offline translation models (~75 MB per language)")
 	}
 	return missing
 }

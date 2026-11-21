@@ -56,7 +56,7 @@ func runSetup(scanner *bufio.Scanner, ollamaModel string, cfg audio.Config) {
 	}
 	cfg.UV, cfg.DataDir = env.UV, env.DataDir
 	cfg = cfg.Resolve()
-	st := ui.Start(fmt.Sprintf("Installing speech engine and Whisper '%s' model", cfg.Model))
+	st := ui.Start(fmt.Sprintf("Installing speech engine, Whisper '%s' model and fast translation models", cfg.Model))
 	cfg.Progress = func(p audio.Progress) {
 		st.Set(p.Message)
 		st.Progress(p.Done, p.Total, p.Unit)
@@ -67,6 +67,9 @@ func runSetup(scanner *bufio.Scanner, ollamaModel string, cfg audio.Config) {
 		log.Fatalf("Setup failed: %v", err)
 	}
 	fmt.Printf("✔ Speech recognition ready (%s on %s, %s)\n", info.Model, info.Device, info.ComputeType)
+	if cfg.FastTranslate {
+		fmt.Printf("✔ Fast translation models downloaded (%s)\n", strings.Join(cfg.FastLanguages, ", "))
+	}
 	fmt.Printf("✔ Setup complete. Data is stored in %s\n", env.DataDir)
 }
 

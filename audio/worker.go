@@ -36,6 +36,10 @@ var workerScript []byte
 // prebuilt wheels (ctranslate2, onnxruntime) are always available.
 const PythonVersion = "3.12"
 
+// DefaultFastLanguages are the languages whose fast-translation models are
+// downloaded when -voice-lang doesn't name any (about 75 MB each).
+var DefaultFastLanguages = []string{"ru", "uk", "pl", "tr", "de", "es", "fr"}
+
 // Config describes how to run the worker.
 type Config struct {
 	UV          string // path to the uv executable
@@ -51,8 +55,9 @@ type Config struct {
 	// long, even if the speaker hasn't paused yet; 0 = the worker's default.
 	MaxSpeechSecs int
 	// FastTranslate enables the worker's offline Opus-MT translation to
-	// English (Worker.Translate). FastLanguages are preloaded in the
-	// background; others load the first time they are heard.
+	// English (Worker.Translate). The models of FastLanguages (default:
+	// DefaultFastLanguages) are downloaded when the worker starts or is
+	// prepared, never while playing; other languages use the LLM.
 	FastTranslate bool
 	FastLanguages []string
 
@@ -153,6 +158,9 @@ func (c Config) Resolve() Config {
 	if c.BufferSecs <= 0 {
 		c.BufferSecs = 30
 	}
+	if c.FastTranslate && len(c.FastLanguages) == 0 {
+		c.FastLanguages = DefaultFastLanguages
+	}
 	return c
 }
 
@@ -230,11 +238,7 @@ func (c Config) command(ctx context.Context, extra ...string) (*exec.Cmd, error)
 		}
 	}
 	if c.FastTranslate {
-		langs := "auto"
-		if len(c.FastLanguages) > 0 {
-			langs = strings.Join(c.FastLanguages, ",")
-		}
-		args = append(args, "--nmt-langs", langs)
+		args = append(args, "--nmt-langs", strings.Join(c.Resolve().FastLanguages, ","))
 	}
 	args = append(args, extra...)
 

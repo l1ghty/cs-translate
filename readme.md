@@ -136,3 +136,4 @@ docker volume rm cs-translate-models
 - **Noise filtering:** segments Whisper itself rates as silence, noise or looping text are dropped before translation.
 - **Callout cache:** very common callouts (`раш б` -> `Rush B`) are translated instantly without the LLM when translating to English.
 - **Short voice answers:** voice translations are streamed from Ollama and capped at 96 tokens.
+- **Offline fast translation:** short callouts (up to 12 words) spoken in a supported language are translated to English by a small Opus-MT model on the CPU in tens of milliseconds, falling back to the LLM otherwise. Its models (~75 MB per language) are downloaded **beforehand**: by `-setup`, or at startup before the speech engine reports ready, never while you play. They cover the languages in `-voice-lang`, or `ru, uk, pl, tr, de, es, fr` when that is unset. Turn it off with `-fast-translate=false`.

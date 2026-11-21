@@ -240,7 +240,7 @@ func TestCommandPassesFastLanguages(t *testing.T) {
 	}
 	c.FastLanguages = nil
 	cmd, _ = c.command(context.Background())
-	if !strings.Contains(strings.Join(cmd.Args, " "), "--nmt-langs auto") {
+	if !strings.Contains(strings.Join(cmd.Args, " "), "--nmt-langs "+strings.Join(DefaultFastLanguages, ",")) {
 		t.Errorf("args = %v", cmd.Args)
 	}
 	c.FastTranslate = false

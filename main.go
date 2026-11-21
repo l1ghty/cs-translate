@@ -57,6 +57,8 @@ func main() {
 		AudioDevice: *audioDevice,
 		BufferSecs:  captureSeconds * 2,
 
+		FastLanguages: fastLanguages(*voiceLang),
+
 		MaxSpeechSecs: max(*voiceInterval, 1),
 	}
 
@@ -65,6 +67,7 @@ func main() {
 		return
 	}
 	if *setupOnly {
+		speechCfg.FastTranslate = *fastTranslate // fetch the fast-translation models too
 		runSetup(scanner, *ollamaModel, speechCfg)
 		return
 	}
@@ -108,11 +111,6 @@ func main() {
 		speechCfg.UV = env.UV
 		speechCfg.DataDir = env.DataDir
 		speechCfg.FastTranslate = *fastTranslate && strings.EqualFold(translator.LanguageCode(*targetLang), "en")
-		for _, l := range strings.Split(*voiceLang, ",") {
-			if l = strings.ToLower(strings.TrimSpace(l)); l != "" && l != "en" {
-				speechCfg.FastLanguages = append(speechCfg.FastLanguages, l)
-			}
-		}
 		speechCfg.Live = !isEchoMode // echo mode only transcribes on F9: zero load while idle
 	}
 	worker, err := loadModels(ctx, tr, *ollamaModel, *useVoice, speechCfg)
@@ -141,6 +139,18 @@ func main() {
 	}
 	s.busy.stop()
 	fmt.Println("\nStopping...")
+}
+
+// fastLanguages lists the spoken languages (-voice-lang) that get a fast
+// offline translation model; nil means the default set.
+func fastLanguages(voiceLang string) []string {
+	var out []string
+	for _, l := range strings.Split(voiceLang, ",") {
+		if l = strings.ToLower(strings.TrimSpace(l)); l != "" && l != "en" {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // loadModels loads the translation model and (if voice is on) the speech

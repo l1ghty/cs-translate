@@ -623,12 +623,49 @@ def asr_loop(model, args, jobs):
 
 # CTranslate2 conversions of the Helsinki-NLP Opus-MT models, one per language.
 NMT_REPO = "gaudi/opus-mt-{lang}-en-ctranslate2"
+NMT_FILES = ["config.json", "model.bin", "source.spm", "target.spm", "*vocabulary*"]
+
+
+def nmt_download(models_dir, lang, message=None):
+    """Return the local path of a language's fast-translation model. With a
+    message, a missing model is downloaded (reporting progress); without one
+    only the local cache is used, so nothing is ever fetched mid-game."""
+    import huggingface_hub
+
+    repo = NMT_REPO.format(lang=lang)
+    cache_dir = models_dir or None
+    try:
+        return huggingface_hub.snapshot_download(repo, cache_dir=cache_dir, allow_patterns=NMT_FILES,
+                                                 local_files_only=True)
+    except Exception:
+        if message is None:
+            raise
+    progress = DownloadProgress(message)
+    path = huggingface_hub.snapshot_download(repo, cache_dir=cache_dir, allow_patterns=NMT_FILES,
+                                             tqdm_class=progress.tqdm_class())
+    progress.report(force=True)
+    return path
+
+
+def prefetch_nmt(models_dir, langs):
+    """Download the fast-translation models up front (startup / setup), so
+    they are on disk before the game starts. A language without a model only
+    produces a warning: its speech goes to the LLM."""
+    for i, lang in enumerate(langs, 1):
+        message = f"Downloading fast translation model {lang} -> en ({i}/{len(langs)})"
+        status(message)
+        try:
+            nmt_download(models_dir, lang, message)
+        except Exception as e:
+            emit("warning", message=f"fast translation for '{lang}' unavailable ({type(e).__name__}); "
+                 "its speech will be translated by the LLM")
 
 
 class NmtEngine:
-    """Tiny int8 Marian models for <source>-to-English. A language's model is
-    downloaded in the background the first time it is wanted; until it is
-    ready translate() answers None and the host falls back to the LLM."""
+    """Tiny int8 Marian models for <source>-to-English. Models are downloaded
+    beforehand (prefetch_nmt) and loaded from disk in the background; while a
+    model is not loaded (or doesn't exist) translate() answers None and the
+    host falls back to the LLM."""
 
     def __init__(self, models_dir, load=None):
         self.models_dir = models_dir
@@ -640,10 +677,9 @@ class NmtEngine:
 
     def _load_model(self, lang):
         import ctranslate2
-        import huggingface_hub
         import sentencepiece as spm
 
-        path = huggingface_hub.snapshot_download(NMT_REPO.format(lang=lang), cache_dir=self.models_dir or None)
+        path = nmt_download(self.models_dir, lang)  # cache only: no downloads while playing
         tr = ctranslate2.Translator(path, device="cpu", compute_type="int8", inter_threads=1, intra_threads=1)
         return (tr, spm.SentencePieceProcessor(model_file=os.path.join(path, "source.spm")),
                 spm.SentencePieceProcessor(model_file=os.path.join(path, "target.spm")))
@@ -665,7 +701,7 @@ class NmtEngine:
         except Exception as e:
             with self.lock:
                 self.failed.add(lang)  # unsupported language or offline: use the LLM
-            emit("warning", message=f"fast translation for '{lang}' unavailable ({type(e).__name__}); using the LLM")
+            log(f"fast translation for '{lang}' unavailable ({type(e).__name__}: {e}); using the LLM")
         finally:
             with self.lock:
                 self.loading.discard(lang)
@@ -721,7 +757,8 @@ def main():
     ap.add_argument("--max-speech-seconds", type=float, default=5.0,
                     help="live mode: transcribe after this much continuous speech even without a pause")
     ap.add_argument("--nmt-langs", default="",
-                    help="enable fast offline translation to English; languages to preload (comma-separated, or 'auto')")
+                    help="enable fast offline translation to English for these languages (comma-separated); "
+                        "their models are downloaded at startup / --prepare")
     ap.add_argument("--models-dir", default="")
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--prepare", action="store_true", help="download model, then exit")
@@ -754,6 +791,9 @@ def main():
 
     model, device, compute = load_model(args)
     warm_up(np, model, parse_languages(args.language))
+    nmt_langs = [l for l in parse_languages(args.nmt_langs) if l != "en"]
+    if nmt_langs:
+        prefetch_nmt(args.models_dir, nmt_langs)
 
     if args.prepare:
         emit("ready", model=args.model, device=device, compute_type=compute, threads=args.threads, audio_device="")
@@ -782,13 +822,12 @@ def main():
     asr.start()
 
     nmt_jobs = None
-    if args.nmt_langs:
+    if nmt_langs:
         engine = NmtEngine(args.models_dir)
         nmt_jobs = queue.Queue()
         threading.Thread(target=nmt_loop, args=(engine, nmt_jobs), daemon=True).start()
-        for lang in parse_languages(args.nmt_langs):
-            if lang != "auto":
-                engine.prepare(lang)
+        for lang in nmt_langs:
+            engine.prepare(lang)  # from disk, in the background
 
     emit("ready", model=args.model, device=device, compute_type=compute, threads=args.threads, audio_device=audio_name)
 
