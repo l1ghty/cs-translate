@@ -264,3 +264,26 @@ func TestCommandPassesDenoise(t *testing.T) {
 		t.Error("--denoise not passed")
 	}
 }
+
+func TestCommandPassesAppAudio(t *testing.T) {
+	c := Config{UV: "uv", DataDir: t.TempDir(), Model: "tiny"}
+	args := func() string {
+		cmd, _ := c.command(context.Background())
+		return strings.Join(cmd.Args, " ")
+	}
+	if strings.Contains(args(), "--app-audio") {
+		t.Error("--app-audio passed although unset")
+	}
+	c.AppAudio = "cs2.exe"
+	if !strings.Contains(args(), "--app-audio cs2.exe") {
+		t.Errorf("args = %s", args())
+	}
+	c.AppAudio = "off"
+	if strings.Contains(args(), "--app-audio") {
+		t.Error("--app-audio passed although off")
+	}
+	c.AppAudio, c.AudioDevice = "cs2.exe", "Headset"
+	if strings.Contains(args(), "--app-audio") {
+		t.Error("--app-audio passed although a device was chosen")
+	}
+}

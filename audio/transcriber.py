@@ -6,6 +6,8 @@
 #   "soundcard>=0.4.4",
 #   "numpy>=1.26",
 #   "msvc-runtime; sys_platform == 'win32'",
+#   # Windows per-application loopback (native extension; only it is used)
+#   "proc-tap>=1.1.1,<2; sys_platform == 'win32' and platform_machine == 'AMD64'",
 #   # RNNoise denoiser (ships librnnoise as a wheel). Only platforms that have a
 #   # wheel, or uv could not resolve the script at all.
 #   "pyrnnoise>=0.4.6,<0.5; (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64'))",
@@ -13,7 +15,7 @@
 # # pyrnnoise declares ffmpeg/matplotlib dependencies for its file tools; only its
 # # small ctypes wrapper is used here.
 # [tool.uv]
-# exclude-dependencies = ["audiolab", "av", "matplotlib", "soxr", "soundfile", "smart-open", "jinja2", "humanize", "requests", "click"]
+# exclude-dependencies = ["audiolab", "av", "matplotlib", "soxr", "soundfile", "smart-open", "jinja2", "humanize", "requests", "click", "scipy"]
 # ///
 """cs-translate speech worker.
 
@@ -463,22 +465,237 @@ def denoise(np, rnnoise, audio):
         return audio
 
 
-def capture_loop(sc, np, args, ring, segmenter, stop):
+# --------------------------------------------------------------------------
+# Per-application capture (Windows "Application Loopback")
+# --------------------------------------------------------------------------
+
+# Windows build that introduced process loopback (Windows 10 20H1+ / 11).
+APP_LOOPBACK_MIN_BUILD = 20438
+
+
+def app_loopback_supported():
+    """True on a Windows build that can capture a single process's audio."""
+    return sys.platform == "win32" and sys.getwindowsversion().build >= APP_LOOPBACK_MIN_BUILD
+
+
+def find_pid(name):
+    """Process id of the first running process named `name` (e.g. cs2.exe), or None."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class ENTRY(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if snap in (None, wintypes.HANDLE(-1).value):
+        return None
+    try:
+        entry = ENTRY()
+        entry.dwSize = ctypes.sizeof(ENTRY)
+        ok = k32.Process32FirstW(wintypes.HANDLE(snap), ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.lower() == name.lower():
+                return int(entry.th32ProcessID)
+            ok = k32.Process32NextW(wintypes.HANDLE(snap), ctypes.byref(entry))
+    finally:
+        k32.CloseHandle(wintypes.HANDLE(snap))
+    return None
+
+
+def load_proctap_native():
+    """Load the ProcTap C++ extension without importing the proctap package
+    (its __init__ needs scipy, which isn't installed). None if unavailable."""
+    try:
+        import glob
+        import importlib.machinery
+        import importlib.util
+
+        spec = importlib.util.find_spec("proctap")
+        if spec is None or not spec.submodule_search_locations:
+            return None
+        files = glob.glob(os.path.join(list(spec.submodule_search_locations)[0], "_native*.pyd"))
+        if not files:
+            return None
+        # the module name must be "_native": the extension's init function is PyInit__native
+        mod_spec = importlib.util.spec_from_file_location(
+            "_native", files[0], loader=importlib.machinery.ExtensionFileLoader("_native", files[0]))
+        mod = importlib.util.module_from_spec(mod_spec)
+        mod_spec.loader.exec_module(mod)
+        return mod
+    except Exception as e:
+        log(f"application loopback unavailable ({type(e).__name__}: {e})")
+        return None
+
+
+class Resampler16k:
+    """Streaming mono resampler to 16 kHz: a low-pass (below 16 kHz / 2) then
+    linear interpolation, keeping its position between chunks."""
+
+    TAPS = 64
+
+    def __init__(self, np, rate):
+        self.np = np
+        self.rate = rate
+        self.step = rate / SAMPLE_RATE
+        n = np.arange(self.TAPS) - (self.TAPS - 1) / 2
+        h = np.sinc(2 * 7600 / rate * n) * np.hanning(self.TAPS)
+        self.h = (h / h.sum()).astype(np.float32)
+        self.tail = np.zeros(self.TAPS - 1, dtype=np.float32)
+        self.rest = np.zeros(0, dtype=np.float32)  # filtered samples not yet consumed
+        self.pos = 0.0                              # next output position within `rest`
+
+    def process(self, x):
+        np = self.np
+        if self.rate == SAMPLE_RATE:
+            return x.astype(np.float32, copy=False)
+        if len(x) == 0:
+            return np.zeros(0, dtype=np.float32)
+        ext = np.concatenate((self.tail, x.astype(np.float32, copy=False)))
+        self.tail = ext[-(self.TAPS - 1):].copy()
+        sig = np.concatenate((self.rest, np.convolve(ext, self.h, mode="valid")))
+        count = int((len(sig) - 1 - self.pos) // self.step) + 1 if len(sig) - 1 >= self.pos else 0
+        if count <= 0:
+            self.rest = sig
+            return np.zeros(0, dtype=np.float32)
+        idx = self.pos + np.arange(count) * self.step
+        out = np.interp(idx, np.arange(len(sig)), sig).astype(np.float32)
+        nxt = self.pos + count * self.step
+        keep = min(int(nxt), len(sig))  # the next position may lie beyond this chunk
+        self.rest = sig[keep:]
+        self.pos = nxt - keep
+        return out
+
+
+class AppCapture:
+    """Audio of one application (and its child processes) as 16 kHz mono
+    float32, using Windows Application Loopback. Other programs (Discord,
+    music, videos) are not captured."""
+
+    def __init__(self, np, native, pid, clock=time.monotonic):
+        self.np = np
+        self.pid = pid
+        self.clock = clock
+        self.cap = native.ProcessLoopback(pid)
+        fmt = self.cap.get_format()
+        self.rate, self.channels, self.bits = fmt["sample_rate"], fmt["channels"], fmt["bits_per_sample"]
+        self.resampler = Resampler16k(np, self.rate)
+        self.t0 = None
+        self.delivered = 0
+
+    def start(self):
+        self.cap.start()
+        if not self.cap.is_process_specific():
+            # Windows quietly fell back to recording everything: that is what we avoid
+            err = self.cap.get_last_error()
+            self.stop()
+            raise RuntimeError("Windows could not capture a single application" + (f" ({err})" if err else ""))
+        self.t0 = self.clock()
+
+    def stop(self):
+        try:
+            self.cap.stop()
+        except Exception:
+            pass
+
+    def _mono16k(self, raw):
+        np = self.np
+        if self.bits == 32:
+            x = np.frombuffer(raw, dtype=np.float32)
+        elif self.bits == 16:
+            x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        else:
+            raise RuntimeError(f"unsupported capture format ({self.bits} bit)")
+        usable = len(x) // self.channels * self.channels
+        x = x[:usable].reshape(-1, self.channels).mean(axis=1) if self.channels > 1 else x[:usable]
+        return self.resampler.process(x)
+
+    def read(self):
+        """New 16 kHz samples. A process only produces audio while it plays
+        something, but the voice detector needs the silence in between to tell
+        when a sentence ended, so gaps are filled with silence in real time."""
+        np = self.np
+        raw = self.cap.read()
+        now = self.clock()
+        out = self._mono16k(raw) if raw else np.zeros(0, dtype=np.float32)
+        self.delivered += len(out)
+        expected = (now - self.t0) * SAMPLE_RATE
+        if len(out) == 0:
+            gap = int(expected - self.delivered)
+            if gap >= SAMPLE_RATE // 10:
+                self.delivered += gap
+                return np.zeros(gap, dtype=np.float32)
+        elif self.delivered > expected + SAMPLE_RATE:  # data ran ahead of the clock: re-sync
+            self.t0 = now - self.delivered / SAMPLE_RATE
+        return out
+
+
+def capture_loop(sc, np, args, ring, segmenter, stop, native=None):
+    """Feed the ring buffer and VAD. While the app named by --app-audio is
+    running (Windows), only its audio is used; otherwise (or if that can't
+    work) everything the user hears."""
     block = SAMPLE_RATE // 10  # 100 ms per read keeps wake-ups (and CPU) low
+    app = args.app_audio if not args.audio_device and app_loopback_supported() else ""
     warned = False
+    failed_pid = None  # a process that app capture didn't work for; don't retry it
+
+    def deliver(data):
+        ring.write(data)
+        if segmenter is not None:
+            segmenter.feed(data)
+
     while not stop.is_set():
         try:
+            pid = find_pid(app) if app else None
+            if pid and pid != failed_pid:
+                native = native or load_proctap_native()
+                try:
+                    if native is None:
+                        raise RuntimeError("application loopback component not available")
+                    cap = AppCapture(np, native, pid)
+                    cap.start()
+                except Exception as e:
+                    failed_pid = pid
+                    emit("warning", message=f"cannot capture only {app} ({e}); using all system audio")
+                    continue
+                log(f"capturing audio from: {app} only (pid {pid})")
+                last_check = time.monotonic()
+                try:
+                    while not stop.is_set():
+                        data = cap.read()
+                        if len(data):
+                            deliver(data)
+                        stop.wait(0.02)
+                        if time.monotonic() - last_check >= 1.0:
+                            last_check = time.monotonic()
+                            if find_pid(app) != pid:
+                                break  # the game closed
+                finally:
+                    cap.stop()
+                log(f"{app} stopped; capturing all system audio again")
+                continue
+
             mic = resolve_device(sc, args.audio_device)
             log(f"capturing audio from: {mic.name}")
+            blocks = 0
             with mic.recorder(samplerate=SAMPLE_RATE, channels=1, blocksize=block) as rec:
                 while not stop.is_set():
                     data = rec.record(numframes=block)
                     if data.ndim > 1:
                         data = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
-                    data = np.ascontiguousarray(data, dtype=np.float32)
-                    ring.write(data)
-                    if segmenter is not None:
-                        segmenter.feed(data)
+                    deliver(np.ascontiguousarray(data, dtype=np.float32))
+                    blocks += 1
+                    if app and blocks % 10 == 0:  # once a second: has the game started?
+                        p = find_pid(app)
+                        if p and p != failed_pid:
+                            break
         except Exception as e:
             if not warned:
                 emit("warning", message=f"audio capture problem: {e}; retrying")
@@ -869,6 +1086,8 @@ def main():
     ap.add_argument("--buffer-seconds", type=float, default=30.0)
     ap.add_argument("--max-speech-seconds", type=float, default=5.0,
                     help="live mode: transcribe after this much continuous speech even without a pause")
+    ap.add_argument("--app-audio", default="",
+                    help="Windows: capture only this program's audio (e.g. cs2.exe) while it is running")
     ap.add_argument("--denoise", action="store_true", help="suppress noise (RNNoise) before voice detection")
     ap.add_argument("--nmt-langs", default="",
                     help="enable fast offline translation to English for these languages (comma-separated); "
