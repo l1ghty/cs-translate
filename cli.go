@@ -184,12 +184,13 @@ type voiceContextItem struct {
 // voiceTranslator translates speech, using the last few seconds of speech as context.
 type voiceTranslator struct {
 	tr         *translator.OllamaTranslator
+	worker     *audio.Worker // offline fast translation; may be nil
 	targetCode string
 	history    []voiceContextItem
 }
 
-func newVoiceTranslator(tr *translator.OllamaTranslator) *voiceTranslator {
-	return &voiceTranslator{tr: tr, targetCode: translator.LanguageCode(tr.TargetLanguage())}
+func newVoiceTranslator(tr *translator.OllamaTranslator, worker *audio.Worker) *voiceTranslator {
+	return &voiceTranslator{tr: tr, worker: worker, targetCode: translator.LanguageCode(tr.TargetLanguage())}
 }
 
 const voiceContextWindow = 10 * time.Second
@@ -197,21 +198,39 @@ const voiceContextWindow = 10 * time.Second
 // translate returns the translation of t, or the original text if it is
 // already in the target language (no LLM call needed).
 func (v *voiceTranslator) translate(ctx context.Context, t audio.Transcript) (string, bool) {
+	text, _, translated := v.translateVia(ctx, t)
+	return text, translated
+}
+
+// fastMaxWords: longer speech goes to the LLM, which handles it better than
+// the small offline model; the fast path is for short callouts.
+const fastMaxWords = 12
+
+// translateVia is translate, also reporting which engine answered
+// ("cache", "fast" or "" for the LLM / no translation).
+func (v *voiceTranslator) translateVia(ctx context.Context, t audio.Transcript) (text, via string, translated bool) {
 	now := time.Now()
 	contextText := v.contextText(now)
 	v.history = append(v.history, voiceContextItem{text: t.Text, timestamp: now})
 
 	if v.targetCode != "" && t.Language == v.targetCode && t.LanguageProbability >= 0.5 {
-		return t.Text, false
+		return t.Text, "", false
 	}
-	if fast, ok := callouts.Lookup(t.Language, t.Text); ok && v.targetCode == "en" {
-		return fast, true // common callout: no LLM call needed
+	if v.targetCode == "en" {
+		if fast, ok := callouts.Lookup(t.Language, t.Text); ok {
+			return fast, "cache", true // common callout: no LLM call needed
+		}
+		if v.worker != nil && len(strings.Fields(t.Text)) <= fastMaxWords {
+			if out, ok := v.worker.Translate(ctx, t.Language, t.Text); ok {
+				return out, "fast", true
+			}
+		}
 	}
-	translated, err := v.tr.TranslateWithContext(ctx, t.Text, translator.VoiceContext{ContextText: contextText, Voice: true})
+	out, err := v.tr.TranslateWithContext(ctx, t.Text, translator.VoiceContext{ContextText: contextText, Voice: true})
 	if err != nil {
-		return t.Text, false
+		return t.Text, "", false
 	}
-	return translated, true
+	return out, "", true
 }
 
 // contextText drops history older than the context window and joins the rest.
@@ -237,8 +256,12 @@ func (v *voiceTranslator) printOriginal(t audio.Transcript) {
 // already in the target language).
 func (v *voiceTranslator) printTranslation(ctx context.Context, t audio.Transcript) {
 	start := time.Now()
-	translated, didTranslate := v.translate(ctx, t)
+	translated, via, didTranslate := v.translateVia(ctx, t)
 	if didTranslate {
-		ui.Printf("\033[1;32mTranslated (%.2fs): %s\033[0m\n", time.Since(start).Seconds(), translated)
+		tag := ""
+		if via != "" {
+			tag = ", " + via
+		}
+		ui.Printf("\033[1;32mTranslated (%.2fs%s): %s\033[0m\n", time.Since(start).Seconds(), tag, translated)
 	}
 }

@@ -2,6 +2,7 @@
 # requires-python = ">=3.10,<3.14"
 # dependencies = [
 #   "faster-whisper>=1.2,<2",
+#   "sentencepiece>=0.2",
 #   "soundcard>=0.4.4",
 #   "numpy>=1.26",
 #   "msvc-runtime; sys_platform == 'win32'",
@@ -21,7 +22,9 @@ runs Whisper when the VAD has found speech (live mode) or when asked to
 Protocol (driven by the Go host):
   stdout  one JSON object per line ("event": status | progress | ready |
           job_start | transcript | job_done | devices | error | warning)
-  stdin   one command per line: "capture <seconds>", "prompt <text>" or "quit". EOF = quit.
+  stdin   one command per line: "capture <seconds>", "prompt <text>",
+          "translate <id> <lang> <text>" (fast offline translation to English,
+          answered with a "translation" event) or "quit". EOF = quit.
   stderr  human-readable logs (passed through to the terminal).
 """
 
@@ -615,6 +618,87 @@ def asr_loop(model, args, jobs):
 
 
 # --------------------------------------------------------------------------
+# Fast offline translation (Opus-MT on CTranslate2, CPU only)
+# --------------------------------------------------------------------------
+
+# CTranslate2 conversions of the Helsinki-NLP Opus-MT models, one per language.
+NMT_REPO = "gaudi/opus-mt-{lang}-en-ctranslate2"
+
+
+class NmtEngine:
+    """Tiny int8 Marian models for <source>-to-English. A language's model is
+    downloaded in the background the first time it is wanted; until it is
+    ready translate() answers None and the host falls back to the LLM."""
+
+    def __init__(self, models_dir, load=None):
+        self.models_dir = models_dir
+        self.models = {}   # lang -> (ctranslate2.Translator, src spm, tgt spm)
+        self.loading = set()
+        self.failed = set()
+        self.lock = threading.Lock()
+        self._load = load or self._load_model
+
+    def _load_model(self, lang):
+        import ctranslate2
+        import huggingface_hub
+        import sentencepiece as spm
+
+        path = huggingface_hub.snapshot_download(NMT_REPO.format(lang=lang), cache_dir=self.models_dir or None)
+        tr = ctranslate2.Translator(path, device="cpu", compute_type="int8", inter_threads=1, intra_threads=1)
+        return (tr, spm.SentencePieceProcessor(model_file=os.path.join(path, "source.spm")),
+                spm.SentencePieceProcessor(model_file=os.path.join(path, "target.spm")))
+
+    def prepare(self, lang):
+        """Start loading a language's model in the background (idempotent)."""
+        with self.lock:
+            if lang in self.models or lang in self.loading or lang in self.failed:
+                return
+            self.loading.add(lang)
+        threading.Thread(target=self._prepare, args=(lang,), daemon=True).start()
+
+    def _prepare(self, lang):
+        try:
+            model = self._load(lang)
+            with self.lock:
+                self.models[lang] = model
+            log(f"fast translation ready: {lang} -> en")
+        except Exception as e:
+            with self.lock:
+                self.failed.add(lang)  # unsupported language or offline: use the LLM
+            emit("warning", message=f"fast translation for '{lang}' unavailable ({type(e).__name__}); using the LLM")
+        finally:
+            with self.lock:
+                self.loading.discard(lang)
+
+    def translate(self, lang, text):
+        """English translation of text, or None when no model is ready."""
+        with self.lock:
+            model = self.models.get(lang)
+        if model is None:
+            self.prepare(lang)
+            return None
+        tr, src, tgt = model
+        tokens = src.encode(text, out_type=str) + ["</s>"]
+        result = tr.translate_batch([tokens], beam_size=2, max_decoding_length=64, max_batch_size=1)
+        out = tgt.decode(result[0].hypotheses[0]).strip()
+        return out or None
+
+
+def nmt_loop(engine, jobs):
+    while True:
+        job = jobs.get()
+        if job is None:
+            return
+        ident, lang, text = job
+        try:
+            out = engine.translate(lang, text)
+        except Exception as e:
+            log(f"fast translation failed: {e}")
+            out = None
+        emit("translation", id=ident, text=out or "", ok=out is not None)
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
@@ -636,6 +720,8 @@ def main():
     ap.add_argument("--buffer-seconds", type=float, default=30.0)
     ap.add_argument("--max-speech-seconds", type=float, default=5.0,
                     help="live mode: transcribe after this much continuous speech even without a pause")
+    ap.add_argument("--nmt-langs", default="",
+                    help="enable fast offline translation to English; languages to preload (comma-separated, or 'auto')")
     ap.add_argument("--models-dir", default="")
     ap.add_argument("--list-devices", action="store_true")
     ap.add_argument("--prepare", action="store_true", help="download model, then exit")
@@ -695,6 +781,15 @@ def main():
     asr = threading.Thread(target=asr_loop, args=(model, args, jobs), daemon=True)
     asr.start()
 
+    nmt_jobs = None
+    if args.nmt_langs:
+        engine = NmtEngine(args.models_dir)
+        nmt_jobs = queue.Queue()
+        threading.Thread(target=nmt_loop, args=(engine, nmt_jobs), daemon=True).start()
+        for lang in parse_languages(args.nmt_langs):
+            if lang != "auto":
+                engine.prepare(lang)
+
     emit("ready", model=args.model, device=device, compute_type=compute, threads=args.threads, audio_device=audio_name)
 
     for line in sys.stdin:  # EOF means the host went away
@@ -709,6 +804,15 @@ def main():
         elif cmd[0] == "prompt":
             # "prompt <text>": vocabulary hint for Whisper (e.g. the map's callouts)
             set_prompt(line.strip()[len("prompt"):])
+        elif cmd[0] == "translate" and len(cmd) >= 4:
+            # "translate <id> <lang> <text>"; without fast translation enabled
+            # the host is told right away to use the LLM
+            ident, lang = int(cmd[1]), cmd[2]
+            text = line.strip().split(None, 3)[3]
+            if nmt_jobs is None:
+                emit("translation", id=ident, text="", ok=False)
+            else:
+                nmt_jobs.put((ident, lang, text))
         elif cmd[0] == "feed" and args.no_capture:
             # testing hook: feed a raw float32 mono 16 kHz file through the pipeline
             data = np.fromfile(cmd[1], dtype=np.float32)
@@ -716,6 +820,8 @@ def main():
             if segmenter is not None:
                 segmenter.feed(data)
     stop.set()
+    if nmt_jobs is not None:
+        nmt_jobs.put(None)
     jobs.put(("quit", None))
     asr.join(timeout=30)  # let queued work (e.g. a pending capture) finish
 

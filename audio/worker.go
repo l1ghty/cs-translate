@@ -50,6 +50,11 @@ type Config struct {
 	// MaxSpeechSecs (live mode) transcribes an utterance once it is this
 	// long, even if the speaker hasn't paused yet; 0 = the worker's default.
 	MaxSpeechSecs int
+	// FastTranslate enables the worker's offline Opus-MT translation to
+	// English (Worker.Translate). FastLanguages are preloaded in the
+	// background; others load the first time they are heard.
+	FastTranslate bool
+	FastLanguages []string
 
 	// Progress, if set, is called with what the worker is doing while it
 	// starts: installing packages, downloading and loading the model.
@@ -113,6 +118,8 @@ type event struct {
 	Done    int64    `json:"done"`
 	Total   int64    `json:"total"`
 	Unit    string   `json:"unit"`
+	ID      int      `json:"id"`
+	OK      bool     `json:"ok"`
 }
 
 // Worker is a running speech-to-text worker process.
@@ -123,6 +130,9 @@ type Worker struct {
 	mu          sync.Mutex
 	transcripts chan Transcript
 	exited      chan struct{}
+
+	nextID  int
+	pending map[int]chan string // fast translations in flight; "" = use the LLM
 }
 
 // Resolve fills in automatic settings tuned so Whisper never competes
@@ -218,6 +228,13 @@ func (c Config) command(ctx context.Context, extra ...string) (*exec.Cmd, error)
 		if c.MaxSpeechSecs > 0 {
 			args = append(args, "--max-speech-seconds", strconv.Itoa(c.MaxSpeechSecs))
 		}
+	}
+	if c.FastTranslate {
+		langs := "auto"
+		if len(c.FastLanguages) > 0 {
+			langs = strings.Join(c.FastLanguages, ",")
+		}
+		args = append(args, "--nmt-langs", langs)
 	}
 	args = append(args, extra...)
 
@@ -384,6 +401,7 @@ func Start(ctx context.Context, cfg Config) (*Worker, error) {
 		stdin:       stdin,
 		transcripts: make(chan Transcript, 16),
 		exited:      make(chan struct{}),
+		pending:     map[int]chan string{},
 	}
 	go func() {
 		<-p.logs // drain stderr before Wait closes the pipe
@@ -435,6 +453,18 @@ func (w *Worker) read(events <-chan event, ready chan<- error) {
 			t := ev.Transcript
 			t.Kind = KindDone
 			w.transcripts <- t
+		case "translation":
+			w.mu.Lock()
+			ch := w.pending[ev.ID]
+			delete(w.pending, ev.ID)
+			w.mu.Unlock()
+			if ch != nil {
+				if ev.OK {
+					ch <- ev.Text
+				} else {
+					ch <- ""
+				}
+			}
 		case "warning":
 			log.Printf("Speech: %s", ev.Message)
 		case "error":
@@ -456,6 +486,45 @@ func (w *Worker) Transcripts() <-chan Transcript { return w.transcripts }
 // KindDone event.
 func (w *Worker) Capture(seconds int) error {
 	return w.send(fmt.Sprintf("capture %d", seconds))
+}
+
+// fastTimeout bounds how long a fast translation may take before the caller
+// falls back to the LLM. A loaded model answers in tens of milliseconds.
+const fastTimeout = time.Second
+
+// Translate translates text spoken in lang into English with the worker's
+// small offline model. ok is false when that isn't possible right now (model
+// still downloading, language unsupported, worker busy): use the LLM instead.
+func (w *Worker) Translate(ctx context.Context, lang, text string) (out string, ok bool) {
+	text = strings.Join(strings.Fields(text), " ")
+	if w == nil || lang == "" || strings.ContainsAny(lang, " \t") || text == "" {
+		return "", false
+	}
+	ch := make(chan string, 1)
+	w.mu.Lock()
+	w.nextID++
+	id := w.nextID
+	w.pending[id] = ch
+	w.mu.Unlock()
+	if err := w.send(fmt.Sprintf("translate %d %s %s", id, lang, text)); err != nil {
+		w.forget(id)
+		return "", false
+	}
+	select {
+	case out = <-ch:
+		return out, out != ""
+	case <-time.After(fastTimeout):
+	case <-ctx.Done():
+	case <-w.exited:
+	}
+	w.forget(id)
+	return "", false
+}
+
+func (w *Worker) forget(id int) {
+	w.mu.Lock()
+	delete(w.pending, id)
+	w.mu.Unlock()
 }
 
 // SetPrompt gives Whisper a vocabulary hint (e.g. the current map's callouts).

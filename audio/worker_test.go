@@ -181,3 +181,71 @@ done
 		t.Errorf("worker got %q", b)
 	}
 }
+
+func TestFastTranslateRoundTripAndFallback(t *testing.T) {
+	uv := fakeUV(t, `
+echo '{"event":"ready","model":"tiny"}'
+while read cmd id lang text; do
+  case "$cmd" in
+  translate)
+    if [ "$lang" = ru ]; then echo '{"event":"translation","id":'$id',"text":"Rush B ('"$text"')","ok":true}'
+    else echo '{"event":"translation","id":'$id',"text":"","ok":false}'; fi;;
+  quit) exit 0;;
+  esac
+done
+`)
+	w, err := Start(context.Background(), Config{UV: uv, DataDir: t.TempDir(), Model: "tiny"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if out, ok := w.Translate(context.Background(), "ru", "раш  б"); !ok || out != "Rush B (раш б)" {
+		t.Errorf("ru: %q %v", out, ok)
+	}
+	if out, ok := w.Translate(context.Background(), "xx", "hello"); ok {
+		t.Errorf("unsupported language answered %q", out)
+	}
+	if _, ok := w.Translate(context.Background(), "bad lang", "x"); ok {
+		t.Error("lang with a space accepted")
+	}
+}
+
+func TestFastTranslateTimesOut(t *testing.T) {
+	uv := fakeUV(t, `
+echo '{"event":"ready","model":"tiny"}'
+while read cmd rest; do [ "$cmd" = quit ] && exit 0; done
+`)
+	w, err := Start(context.Background(), Config{UV: uv, DataDir: t.TempDir(), Model: "tiny"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	start := time.Now()
+	if _, ok := w.Translate(context.Background(), "ru", "привет"); ok || time.Since(start) < fastTimeout/2 {
+		t.Errorf("expected a timeout fallback (ok=%v after %v)", ok, time.Since(start))
+	}
+	w.mu.Lock()
+	n := len(w.pending)
+	w.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d pending requests leaked", n)
+	}
+}
+
+func TestCommandPassesFastLanguages(t *testing.T) {
+	c := Config{UV: "uv", DataDir: t.TempDir(), Model: "tiny", FastTranslate: true, FastLanguages: []string{"ru", "de"}}
+	cmd, _ := c.command(context.Background())
+	if !strings.Contains(strings.Join(cmd.Args, " "), "--nmt-langs ru,de") {
+		t.Errorf("args = %v", cmd.Args)
+	}
+	c.FastLanguages = nil
+	cmd, _ = c.command(context.Background())
+	if !strings.Contains(strings.Join(cmd.Args, " "), "--nmt-langs auto") {
+		t.Errorf("args = %v", cmd.Args)
+	}
+	c.FastTranslate = false
+	cmd, _ = c.command(context.Background())
+	if strings.Contains(strings.Join(cmd.Args, " "), "--nmt-langs") {
+		t.Errorf("args = %v", cmd.Args)
+	}
+}

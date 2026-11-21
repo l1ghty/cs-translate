@@ -40,6 +40,7 @@ func main() {
 	whisperThreads := flag.Int("whisper-threads", 0, "CPU threads for speech recognition (0 = auto, leaves most cores to the game)")
 	voiceLang := flag.String("voice-lang", "", "Language(s) spoken in voice chat: one code (ru) or a list (ru,en,de) to keep detection within them (default: auto-detect)")
 	voiceInterval := flag.Int("voice-interval", 5, "Live voice: transcribe after this many seconds of speech even if the speaker hasn't paused yet")
+	fastTranslate := flag.Bool("fast-translate", true, "Voice: translate short callouts to English with a small offline model (no LLM, no GPU); falls back to the LLM when unavailable")
 	translateCPU := flag.Bool("translate-cpu", false, "Run the translation model on the CPU only, keeping the GPU free for the game")
 	setupOnly := flag.Bool("setup", false, "Install and download everything needed, then exit")
 	assumeYes := flag.Bool("yes", false, "Answer 'yes' to all setup questions (unattended install)")
@@ -106,6 +107,12 @@ func main() {
 	if *useVoice {
 		speechCfg.UV = env.UV
 		speechCfg.DataDir = env.DataDir
+		speechCfg.FastTranslate = *fastTranslate && strings.EqualFold(translator.LanguageCode(*targetLang), "en")
+		for _, l := range strings.Split(*voiceLang, ",") {
+			if l = strings.ToLower(strings.TrimSpace(l)); l != "" && l != "en" {
+				speechCfg.FastLanguages = append(speechCfg.FastLanguages, l)
+			}
+		}
 		speechCfg.Live = !isEchoMode // echo mode only transcribes on F9: zero load while idle
 	}
 	worker, err := loadModels(ctx, tr, *ollamaModel, *useVoice, speechCfg)
@@ -373,7 +380,7 @@ func newSession(ctx context.Context, tr *translator.OllamaTranslator, worker *au
 		ctx:    ctx,
 		tr:     tr,
 		worker: worker,
-		vt:     newVoiceTranslator(tr),
+		vt:     newVoiceTranslator(tr, worker),
 		busy:   &busy{},
 		jobs:   make(chan func(), 64),
 	}
