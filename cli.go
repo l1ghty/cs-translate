@@ -256,7 +256,7 @@ func (v *voiceTranslator) printOriginal(t audio.Transcript) {
 	if tag != "" {
 		tag += ", "
 	}
-	ui.Printf("\n%sVoice [%s%s, %.1fs audio, recognised in %.2fs]: %s%s\n", on, tag, t.Language, t.AudioSeconds, t.ProcessingSeconds, t.Text, off)
+	ui.Printf("\n%sVoice [%s%s, %.1fs, %.2fs]: %s%s\n", on, tag, t.Language, t.AudioSeconds, t.ProcessingSeconds, t.Text, off)
 }
 
 // speakerColors are readable on dark and light terminals and none is the
