@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/micha/cs-ingame-translate/audio"
+	"github.com/micha/cs-ingame-translate/callouts"
 	"github.com/micha/cs-ingame-translate/setup"
 	"github.com/micha/cs-ingame-translate/translator"
 	"github.com/micha/cs-ingame-translate/ui"
@@ -203,7 +204,10 @@ func (v *voiceTranslator) translate(ctx context.Context, t audio.Transcript) (st
 	if v.targetCode != "" && t.Language == v.targetCode && t.LanguageProbability >= 0.5 {
 		return t.Text, false
 	}
-	translated, err := v.tr.TranslateWithContext(ctx, t.Text, translator.VoiceContext{ContextText: contextText})
+	if fast, ok := callouts.Lookup(t.Language, t.Text); ok && v.targetCode == "en" {
+		return fast, true // common callout: no LLM call needed
+	}
+	translated, err := v.tr.TranslateWithContext(ctx, t.Text, translator.VoiceContext{ContextText: contextText, Voice: true})
 	if err != nil {
 		return t.Text, false
 	}

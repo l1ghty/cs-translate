@@ -156,3 +156,28 @@ func TestCommandPassesVoiceInterval(t *testing.T) {
 		t.Error("interval not passed in live mode")
 	}
 }
+
+func TestSetPromptIsOneLine(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "got")
+	uv := fakeUV(t, `
+echo '{"event":"ready","model":"tiny"}'
+while read cmd arg; do
+  case "$cmd" in
+  prompt) echo "$cmd $arg" >> `+out+`;;
+  quit) exit 0;;
+  esac
+done
+`)
+	w, err := Start(context.Background(), Config{UV: uv, DataDir: t.TempDir(), Model: "tiny"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.SetPrompt("AWP,\npalace,   ramp"); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	b, _ := os.ReadFile(out)
+	if strings.TrimSpace(string(b)) != "prompt AWP, palace, ramp" {
+		t.Errorf("worker got %q", b)
+	}
+}

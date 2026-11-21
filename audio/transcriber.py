@@ -21,7 +21,7 @@ runs Whisper when the VAD has found speech (live mode) or when asked to
 Protocol (driven by the Go host):
   stdout  one JSON object per line ("event": status | progress | ready |
           job_start | transcript | job_done | devices | error | warning)
-  stdin   one command per line: "capture <seconds>" or "quit". EOF = quit.
+  stdin   one command per line: "capture <seconds>", "prompt <text>" or "quit". EOF = quit.
   stderr  human-readable logs (passed through to the terminal).
 """
 
@@ -264,8 +264,8 @@ class RingBuffer:
 class VadSegmenter:
     """Streaming Silero VAD that turns a continuous stream into utterances."""
 
-    def __init__(self, np, on_utterance, threshold=0.5, min_silence_s=0.5,
-                 min_speech_s=0.3, max_speech_s=12.0, pad_s=0.25):
+    def __init__(self, np, on_utterance, threshold=0.5, min_silence_s=0.3,
+                 min_speech_s=0.25, max_speech_s=5.0, pad_s=0.2, overlap_s=0.2):
         from faster_whisper.vad import get_vad_model
 
         self.np = np
@@ -277,6 +277,7 @@ class VadSegmenter:
         self.min_speech = int(min_speech_s * SAMPLE_RATE)
         self.max_speech = int(max_speech_s * SAMPLE_RATE)
         self.pad_frames = max(1, int(pad_s * SAMPLE_RATE / VAD_FRAME))
+        self.overlap_frames = max(1, int(overlap_s * SAMPLE_RATE / VAD_FRAME))
         self.h = np.zeros((1, 1, 128), dtype=np.float32)
         self.c = np.zeros((1, 1, 128), dtype=np.float32)
         self.ctx = np.zeros(VAD_CONTEXT, dtype=np.float32)
@@ -323,19 +324,25 @@ class VadSegmenter:
         elif p >= self.threshold:
             self.silence = 0
 
-        if self.silence >= self.min_silence or self.speech_len >= self.max_speech:
+        if self.silence >= self.min_silence:
             self._finish()
+        elif self.speech_len >= self.max_speech:
+            self._finish(keep_overlap=True)
 
-    def _finish(self):
+    def _finish(self, keep_overlap=False):
+        """Hand over the utterance. With keep_overlap the speaker is still
+        talking: the next piece starts with the last moments of this one, so a
+        word cut at the boundary is heard whole by Whisper."""
         np = self.np
         # keep a little trailing silence, drop the rest
         drop = max(0, self.silence - self.pad_frames)
         frames = self.speech[: len(self.speech) - drop] if drop else self.speech
         audio = np.concatenate(frames) if frames else np.zeros(0, dtype=np.float32)
         voiced = self.speech_len - self.silence * VAD_FRAME
-        self.active = False
-        self.speech = []
-        self.speech_len = 0
+        tail = self.speech[-self.overlap_frames:] if keep_overlap else []
+        self.active = keep_overlap
+        self.speech = list(tail)
+        self.speech_len = sum(len(f) for f in tail)
         self.silence = 0
         if voiced >= self.min_speech:
             self.on_utterance(audio)
@@ -500,6 +507,36 @@ def warm_up(np, model, languages):
         emit("warning", message=f"speech warm-up failed: {e}")
 
 
+# Whisper's own signals that a segment is noise or a hallucination.
+MAX_NO_SPEECH_PROB = 0.6
+MIN_AVG_LOGPROB = -1.0
+MAX_COMPRESSION_RATIO = 2.4
+
+# Words/callouts Whisper should expect; steers spelling of CS2 slang.
+BASE_PROMPT = "AWP, eco, force buy, clutch, lit, rotate, plant, defuse, rush B, A site, B site, mid, flash, smoke, molly."
+
+_prompt_lock = threading.Lock()
+_prompt = BASE_PROMPT
+
+
+def set_prompt(text):
+    global _prompt
+    with _prompt_lock:
+        _prompt = text.strip() or BASE_PROMPT
+
+
+def get_prompt():
+    with _prompt_lock:
+        return _prompt
+
+
+def good_segment(seg):
+    """False for segments Whisper itself marks as silence/noise/looping text."""
+    return not (seg.no_speech_prob > MAX_NO_SPEECH_PROB
+                or seg.avg_logprob < MIN_AVG_LOGPROB
+                or seg.compression_ratio > MAX_COMPRESSION_RATIO)
+
+
 def _decode(model, audio, language):
     return model.transcribe(
         audio,
@@ -508,7 +545,8 @@ def _decode(model, audio, language):
         beam_size=1,               # greedy decoding: much cheaper, small quality cost
         best_of=1,
         temperature=0.0,           # no temperature fallback re-decoding
-        condition_on_previous_text=False,
+        condition_on_previous_text=False,  # prevents looping hallucinations
+        initial_prompt=get_prompt(),
         without_timestamps=True,
         vad_filter=False,          # audio is already VAD-segmented
         no_speech_threshold=0.6,
@@ -533,7 +571,7 @@ def transcribe(model, languages, audio):
     parts = []
     for seg in segments:
         text = seg.text.strip()
-        if text and text.lower() not in HALLUCINATIONS:
+        if text and good_segment(seg) and text.lower() not in HALLUCINATIONS:
             parts.append(text)
     return " ".join(parts).strip(), language, probability, time.perf_counter() - t0
 
@@ -596,7 +634,7 @@ def main():
     ap.add_argument("--audio-device", default="")
     ap.add_argument("--live", action="store_true", help="continuously transcribe detected speech")
     ap.add_argument("--buffer-seconds", type=float, default=30.0)
-    ap.add_argument("--max-speech-seconds", type=float, default=12.0,
+    ap.add_argument("--max-speech-seconds", type=float, default=5.0,
                     help="live mode: transcribe after this much continuous speech even without a pause")
     ap.add_argument("--models-dir", default="")
     ap.add_argument("--list-devices", action="store_true")
@@ -668,6 +706,9 @@ def main():
         if cmd[0] == "capture":
             seconds = float(cmd[1]) if len(cmd) > 1 else 15.0
             jobs.put(("capture", ring.last(seconds)))
+        elif cmd[0] == "prompt":
+            # "prompt <text>": vocabulary hint for Whisper (e.g. the map's callouts)
+            set_prompt(line.strip()[len("prompt"):])
         elif cmd[0] == "feed" and args.no_capture:
             # testing hook: feed a raw float32 mono 16 kHz file through the pipeline
             data = np.fromfile(cmd[1], dtype=np.float32)

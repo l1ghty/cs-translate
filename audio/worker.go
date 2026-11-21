@@ -458,6 +458,12 @@ func (w *Worker) Capture(seconds int) error {
 	return w.send(fmt.Sprintf("capture %d", seconds))
 }
 
+// SetPrompt gives Whisper a vocabulary hint (e.g. the current map's callouts).
+func (w *Worker) SetPrompt(text string) error {
+	text = strings.Join(strings.Fields(text), " ") // one line, one command
+	return w.send("prompt " + text)
+}
+
 func (w *Worker) send(line string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()

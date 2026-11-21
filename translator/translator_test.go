@@ -61,7 +61,7 @@ func TestHyMTPromptsAndOptions(t *testing.T) {
 	if got := tr.prompt("rush b", "we go mid"); !strings.HasPrefix(got, "we go mid\n参考上面的信息") || !strings.HasSuffix(got, "English，注意不需要翻译上文，也不要额外解释：\nrush b") {
 		t.Errorf("context prompt = %q", got)
 	}
-	if o := tr.options(); o["top_k"] != 20 || o["temperature"] != 0.7 {
+	if o := tr.options(maxAnswerTokens); o["top_k"] != 20 || o["temperature"] != 0.7 {
 		t.Errorf("options = %v", o)
 	}
 
@@ -74,7 +74,7 @@ func TestHyMTPromptsAndOptions(t *testing.T) {
 	if other.isHyMT() || !strings.HasPrefix(other.prompt("x", ""), "Translate the following text to English.") {
 		t.Errorf("generic prompt = %q", other.prompt("x", ""))
 	}
-	if o := other.options(); o["temperature"] != 0.3 || o["top_k"] != nil {
+	if o := other.options(maxAnswerTokens); o["temperature"] != 0.3 || o["top_k"] != nil {
 		t.Errorf("generic options = %v", o)
 	}
 }
@@ -159,5 +159,28 @@ func TestPreloadUnloadsRetiredDefault(t *testing.T) {
 	}
 	if len(unloaded) != 1 || unloaded[0] != "hf.co/blackcloud1199/qwen-translation-vi:latest" {
 		t.Errorf("unloaded %v, want only the retired default", unloaded)
+	}
+}
+
+func TestTranslationIsStreamedAndVoiceIsCapped(t *testing.T) {
+	var got ollamaRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		enc := json.NewEncoder(w)
+		enc.Encode(ollamaResponse{Response: "Rush "})
+		enc.Encode(ollamaResponse{Response: "B", Done: true})
+	}))
+	defer srv.Close()
+	tr, _ := NewOllamaTranslator(context.Background(), "m", "English", Options{})
+	tr.baseURL = srv.URL
+	out, err := tr.TranslateWithContext(context.Background(), "раш б", VoiceContext{Voice: true})
+	if err != nil || out != "Rush B" {
+		t.Fatalf("out = %q, err = %v", out, err)
+	}
+	if !got.Stream || got.Options["num_predict"] != float64(maxVoiceTokens) {
+		t.Errorf("request = %+v", got)
+	}
+	if _, err := tr.Translate(context.Background(), "привет"); err != nil || got.Options["num_predict"] != float64(maxAnswerTokens) {
+		t.Errorf("chat request = %+v, err = %v", got, err)
 	}
 }

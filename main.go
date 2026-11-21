@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/micha/cs-ingame-translate/audio"
+	"github.com/micha/cs-ingame-translate/callouts"
 	"github.com/micha/cs-ingame-translate/hotkey"
 	"github.com/micha/cs-ingame-translate/monitor"
 	"github.com/micha/cs-ingame-translate/parser"
@@ -38,7 +39,7 @@ func main() {
 	whisperDevice := flag.String("whisper-device", "cpu", "Run speech recognition on 'cpu' (recommended while gaming) or 'cuda' (NVIDIA GPU)")
 	whisperThreads := flag.Int("whisper-threads", 0, "CPU threads for speech recognition (0 = auto, leaves most cores to the game)")
 	voiceLang := flag.String("voice-lang", "", "Language(s) spoken in voice chat: one code (ru) or a list (ru,en,de) to keep detection within them (default: auto-detect)")
-	voiceInterval := flag.Int("voice-interval", 10, "Live voice: transcribe after this many seconds of speech even if the speaker hasn't paused yet")
+	voiceInterval := flag.Int("voice-interval", 5, "Live voice: transcribe after this many seconds of speech even if the speaker hasn't paused yet")
 	translateCPU := flag.Bool("translate-cpu", false, "Run the translation model on the CPU only, keeping the GPU free for the game")
 	setupOnly := flag.Bool("setup", false, "Install and download everything needed, then exit")
 	assumeYes := flag.Bool("yes", false, "Answer 'yes' to all setup questions (unattended install)")
@@ -364,6 +365,7 @@ type session struct {
 	vt     *voiceTranslator
 	busy   *busy
 	jobs   chan func()
+	curMap string // last map seen in console.log
 }
 
 func newSession(ctx context.Context, tr *translator.OllamaTranslator, worker *audio.Worker) *session {
@@ -401,6 +403,7 @@ func (s *session) chatLine(line *tail.Line) {
 	if line.Err != nil {
 		return
 	}
+	s.mapLine(line.Text)
 	msg := parser.ParseLine(line.Text)
 	if msg == nil {
 		return
@@ -416,6 +419,24 @@ func (s *session) chatLine(line *tail.Line) {
 		}
 		outputChat(msg.PlayerName, translated, msg.IsDead, msg.OriginalText)
 	})
+}
+
+// mapLine watches console.log for a map load and tunes Whisper's vocabulary
+// to that map's callouts.
+func (s *session) mapLine(text string) {
+	if parser.ParseLine(text) != nil {
+		return // a player's chat message must not be able to switch the map
+	}
+	m := callouts.MapFromLine(text)
+	if m == "" || m == s.curMap || s.worker == nil {
+		return
+	}
+	s.curMap = m
+	if err := s.worker.SetPrompt(callouts.Prompt(m)); err != nil {
+		log.Printf("Could not set the speech vocabulary for %s: %v", m, err)
+		return
+	}
+	ui.Printf("Map: %s (speech vocabulary updated)\n", m)
 }
 
 func (s *session) capture(trigger string) {

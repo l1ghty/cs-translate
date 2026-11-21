@@ -46,11 +46,13 @@ type ollamaRequest struct {
 type ollamaResponse struct {
 	Response string `json:"response"`
 	Error    string `json:"error,omitempty"`
+	Done     bool   `json:"done,omitempty"`
 }
 
 // VoiceContext represents recent transcription context for voice translation
 type VoiceContext struct {
 	ContextText string // Recent transcriptions from last 10 seconds
+	Voice       bool   // the text is speech: use the short answer limit
 }
 
 // keepAlive keeps the model loaded between translations: reloading it from
@@ -72,6 +74,10 @@ const (
 // maxAnswerTokens caps every answer. A translated chat line or voice clip
 // is far shorter; the cap only stops a model that runs on.
 const maxAnswerTokens = 256
+
+// maxVoiceTokens caps voice answers harder: spoken callouts are a few words,
+// so a model that rambles must not delay the next callout.
+const maxVoiceTokens = 96
 
 // retiredModels are former defaults. If one is still loaded when the tool
 // starts (e.g. after an unclean exit), it is unloaded to free its memory.
@@ -113,7 +119,11 @@ func (t *OllamaTranslator) TranslateWithContext(ctx context.Context, text string
 	}
 
 	prompt := t.prompt(text, vc.ContextText)
-	translation, err := t.generate(ctx, prompt)
+	limit := maxAnswerTokens
+	if vc.ContextText != "" || vc.Voice {
+		limit = maxVoiceTokens
+	}
+	translation, err := t.generate(ctx, prompt, limit)
 	if err != nil {
 		return "", err
 	}
@@ -216,16 +226,16 @@ func (t *OllamaTranslator) KeepWarm(ctx context.Context) {
 // it), with the same options as translations so Ollama doesn't reload it.
 func (t *OllamaTranslator) load(ctx context.Context) error {
 	client := &http.Client{Timeout: 10 * time.Minute} // first load from a slow disk can take long
-	_, err := t.request(ctx, client, "")
+	_, err := t.request(ctx, client, "", maxAnswerTokens)
 	return err
 }
 
-func (t *OllamaTranslator) options() map[string]any {
-	options := map[string]any{"temperature": 0.3, "num_predict": maxAnswerTokens}
+func (t *OllamaTranslator) options(numPredict int) map[string]any {
+	options := map[string]any{"temperature": 0.3, "num_predict": numPredict}
 	if t.isHyMT() {
 		// sampling settings recommended on the Hy-MT2 1.8B/7B model cards
 		options = map[string]any{"temperature": 0.7, "top_p": 0.6, "top_k": 20, "repeat_penalty": 1.05,
-			"num_predict": maxAnswerTokens, "stop": []string{hyEndOfTurn, hyEnd, hyUser}}
+			"num_predict": numPredict, "stop": []string{hyEndOfTurn, hyEnd, hyUser}}
 	}
 	if t.opts.CPUOnly {
 		options["num_gpu"] = 0
@@ -236,12 +246,15 @@ func (t *OllamaTranslator) options() map[string]any {
 	return options
 }
 
-func (t *OllamaTranslator) generate(ctx context.Context, prompt string) (string, error) {
-	return t.request(ctx, t.httpClient, prompt)
+func (t *OllamaTranslator) generate(ctx context.Context, prompt string, numPredict int) (string, error) {
+	return t.request(ctx, t.httpClient, prompt, numPredict)
 }
 
-func (t *OllamaTranslator) request(ctx context.Context, client *http.Client, prompt string) (string, error) {
-	r := ollamaRequest{Model: t.model, Prompt: prompt, KeepAlive: keepAlive, Options: t.options()}
+func (t *OllamaTranslator) request(ctx context.Context, client *http.Client, prompt string, numPredict int) (string, error) {
+	// Translations are streamed (tokens are read as they are generated and the
+	// connection ends the moment the model is done). A load request, which has
+	// no prompt, is a single reply.
+	r := ollamaRequest{Model: t.model, Prompt: prompt, Stream: prompt != "", KeepAlive: keepAlive, Options: t.options(numPredict)}
 	if prompt != "" && t.isHyMT() {
 		// send the prompt already in the model's chat format
 		r.Raw = true
@@ -264,21 +277,31 @@ func (t *OllamaTranslator) request(ctx context.Context, client *http.Client, pro
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
+	var sb strings.Builder
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var out ollamaResponse
+		if err := dec.Decode(&out); err != nil {
+			if resp.StatusCode != http.StatusOK {
+				return "", fmt.Errorf("ollama API returned status %d", resp.StatusCode)
+			}
+			if err == io.EOF {
+				break // stream ended without a final "done" line
+			}
+			return "", fmt.Errorf("failed to read response: %w", err)
+		}
+		if out.Error != "" {
+			return "", fmt.Errorf("ollama error: %s", out.Error)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("ollama API returned status %d", resp.StatusCode)
+		}
+		sb.WriteString(out.Response)
+		if out.Done {
+			break
+		}
 	}
-	var out ollamaResponse
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", fmt.Errorf("failed to parse response: %w", err)
-	}
-	if out.Error != "" {
-		return "", fmt.Errorf("ollama error: %s", out.Error)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("ollama API returned status %d", resp.StatusCode)
-	}
-	return cleanOutput(out.Response), nil
+	return cleanOutput(sb.String()), nil
 }
 
 // cleanOutput drops a reasoning block (<think>...</think>) that some models

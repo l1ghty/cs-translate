@@ -54,7 +54,7 @@ You then choose a mode:
 0. **Change target language:** pick the language to translate into: English, Chinese, Russian, Spanish, Portuguese (the most used languages on Steam), or type any other language name. Your choice is remembered for the next start.
 1. **In-game translate:** translates console chat. You can also turn on **live** voice transcription, which transcribes everything that is said.
 2. **Echo:** translates chat, and when you press **F9** (or **Enter**) it transcribes and translates the **last 15 seconds** of audio. Each utterance in that window is recognized separately, so mixed languages work. This is the lightest option, because speech recognition does nothing until you press the key.
-3. **Auto voice:** translates chat, and transcribes and translates voice **automatically**. Each sentence is sent as soon as the speaker pauses, or after **10 seconds** of non-stop speech (`-voice-interval`), whichever comes first. No key to press, so it costs more CPU than echo mode while people talk.
+3. **Auto voice:** translates chat, and transcribes and translates voice **automatically**. Each sentence is sent as soon as the speaker pauses, or after **5 seconds** of non-stop speech (`-voice-interval`), whichever comes first. No key to press, so it costs more CPU than echo mode while people talk.
 
 CS2 must be started with the `-condebug` launch option so that it writes `console.log`. The tool checks for this and offers to open the Steam settings for you. The log file is found automatically in every Steam library, including libraries on other drives and Flatpak Steam.
 
@@ -64,7 +64,7 @@ CS2 must be started with the `-condebug` launch option so that it writes `consol
 |------|-------------|---------|
 | `-lang` | Target language for translation. Overrides the language saved with menu option 0. | `English` |
 | `-voice` | Enable live voice transcription without asking | off |
-| `-voice-interval` | Live voice (modes 1 and 3): transcribe after this many seconds of speech even if the speaker hasn't paused yet | `10` |
+| `-voice-interval` | Live voice (modes 1 and 3): transcribe after this many seconds of speech even if the speaker hasn't paused yet (pieces overlap by 0.2s so no word is cut) | `5` |
 | `-voice-lang` | Language spoken in voice chat. One code (`ru`) skips detection entirely. A list (`ru,en,de`) keeps detection within those languages, which avoids misdetected short clips. | auto-detect |
 | `-whisper-model` | `auto`, `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, or `distil-large-v3.5` (English only) | `auto` |
 | `-whisper-device` | `cpu`, or `cuda` for an NVIDIA GPU (see [Performance](#performance)) | `cpu` |
@@ -128,3 +128,11 @@ docker rmi cs-translate
 ```bash
 docker volume rm cs-translate-models
 ```
+
+## Tuned for fast callouts
+
+- **Short pauses count:** a 0.3s pause ends an utterance, so one-word callouts are sent right away.
+- **Map-aware recognition:** when `console.log` shows a map load (`de_mirage`, ...), Whisper is primed with that map's callouts (palace, apps, banana, ...).
+- **Noise filtering:** segments Whisper itself rates as silence, noise or looping text are dropped before translation.
+- **Callout cache:** very common callouts (`раш б` -> `Rush B`) are translated instantly without the LLM when translating to English.
+- **Short voice answers:** voice translations are streamed from Ollama and capped at 96 tokens.
