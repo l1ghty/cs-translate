@@ -326,3 +326,45 @@ while read cmd rest; do [ "$cmd" = quit ] && exit 0; done
 		t.Error("--stream not passed")
 	}
 }
+
+func TestSpeakersPlumbing(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "got")
+	uv := fakeUV(t, `
+echo '{"event":"ready","model":"tiny"}'
+echo '{"event":"transcript","source":"live","text":"hi","language":"ru","speaker":2}'
+while read cmd arg; do
+  case "$cmd" in
+  speakers) echo "$cmd $arg" >> `+out+`;;
+  quit) exit 0;;
+  esac
+done
+`)
+	w, err := Start(context.Background(), Config{UV: uv, DataDir: t.TempDir(), Model: "tiny", Speakers: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case tr := <-w.Transcripts():
+		if tr.Kind != KindText || tr.Speaker != 2 {
+			t.Errorf("transcript = %+v", tr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no transcript")
+	}
+	if err := w.ResetSpeakers(); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	if b, _ := os.ReadFile(out); strings.TrimSpace(string(b)) != "speakers reset" {
+		t.Errorf("worker got %q", b)
+	}
+	c := Config{UV: "uv", DataDir: t.TempDir(), Model: "tiny"}
+	args := func() string { cmd, _ := c.command(context.Background()); return strings.Join(cmd.Args, " ") }
+	if strings.Contains(args(), "--speakers") {
+		t.Error("--speakers passed although off")
+	}
+	c.Speakers = true
+	if !strings.Contains(args(), "--speakers") {
+		t.Error("--speakers not passed")
+	}
+}

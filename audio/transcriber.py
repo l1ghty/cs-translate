@@ -31,7 +31,7 @@ runs Whisper when the VAD has found speech (live mode) or when asked to
 Protocol (driven by the Go host):
   stdout  one JSON object per line ("event": status | progress | ready |
           job_start | transcript | job_done | devices | error | warning)
-  stdin   one command per line: "capture <seconds>", "prompt <text>",
+  stdin   one command per line: "capture <seconds>", "prompt <text>", "speakers reset",
           "translate <id> <lang> <text>" (fast offline translation to English,
           answered with a "translation" event) or "quit". EOF = quit.
   stderr  human-readable logs (passed through to the terminal).
@@ -720,6 +720,111 @@ def capture_loop(sc, np, args, ring, segmenter, stop, native=None):
 
 
 # --------------------------------------------------------------------------
+# Speaker tracking (who is talking: a cheap voice fingerprint, no neural net)
+# --------------------------------------------------------------------------
+
+SPK_FRAME = 400   # 25 ms
+SPK_HOP = 160     # 10 ms
+SPK_NFFT = 512
+SPK_MELS = 26
+SPK_COEFFS = 20
+# Typical spread of each MFCC within one speaker, measured on real multi-speaker
+# recordings (pyannote's test data); fingerprints are divided by it.
+SPK_SCALE = [3.962, 3.737, 4.056, 2.758, 1.897, 1.758, 1.619, 1.46, 1.342, 1.124, 1.489, 1.331, 1.039, 1.094, 1.133, 1.058, 0.941, 0.79, 0.575, 0.67]
+SPK_THRESHOLD = 1.9  # distance (in those units) below which a voice is "the same"
+SPK_MIN_FRAMES = 25  # loud frames (0.25 s) needed to say anything about a voice
+
+
+def _mel_filterbank(np, rate=SAMPLE_RATE, n_filters=SPK_MELS, n_fft=SPK_NFFT, fmin=100.0, fmax=7000.0):
+    mel = lambda f: 2595.0 * np.log10(1.0 + f / 700.0)
+    inv = lambda m: 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+    pts = inv(np.linspace(mel(fmin), mel(fmax), n_filters + 2))
+    bins = np.floor((n_fft + 1) * pts / rate).astype(int)
+    fb = np.zeros((n_filters, n_fft // 2 + 1), dtype=np.float32)
+    for i in range(n_filters):
+        lo, mid, hi = bins[i], bins[i + 1], bins[i + 2]
+        for k in range(lo, mid):
+            fb[i, k] = (k - lo) / max(mid - lo, 1)
+        for k in range(mid, hi):
+            fb[i, k] = (hi - k) / max(hi - mid, 1)
+    return fb
+
+
+def speaker_features(np, audio):
+    """A voice fingerprint of one utterance (16 kHz mono float32): the mean of
+    20 MFCCs over its voiced frames (loud frames if few are clearly voiced).
+    None when there is too little speech to judge."""
+    if len(audio) < SPK_FRAME * 4:
+        return None
+    n = 1 + (len(audio) - SPK_FRAME) // SPK_HOP
+    idx = np.arange(SPK_FRAME)[None, :] + SPK_HOP * np.arange(n)[:, None]
+    frames = audio[idx].astype(np.float32)
+    frames = frames - frames.mean(axis=1, keepdims=True)
+    rms = np.sqrt((frames ** 2).mean(axis=1))
+    loud = rms > max(1e-4, 0.15 * float(np.percentile(rms, 95)))
+    if int(loud.sum()) < SPK_MIN_FRAMES:
+        return None
+    # frames with a clear periodic peak (autocorrelation, 70-400 Hz) are voiced
+    spec = np.fft.rfft(frames, 1024, axis=1)
+    ac = np.fft.irfft(spec.real ** 2 + spec.imag ** 2, axis=1)[:, : SPK_FRAME // 2 + 1]
+    lo, hi = SAMPLE_RATE // 400, SAMPLE_RATE // 70
+    seg = ac[:, lo:hi]
+    voiced = loud & (seg.max(axis=1) / np.maximum(ac[:, 0], 1e-9) > 0.3)
+    use = voiced if int(voiced.sum()) >= 15 else loud
+    pre = np.concatenate((frames[:, :1], frames[:, 1:] - 0.97 * frames[:, :-1]), axis=1)[use]
+    pre = pre * np.hamming(SPK_FRAME).astype(np.float32)
+    logmel = np.log((np.abs(np.fft.rfft(pre, SPK_NFFT, axis=1)) ** 2) @ _mel_filterbank(np).T + 1e-8)
+    k = np.arange(SPK_MELS)
+    dct = np.cos(np.pi / SPK_MELS * (k[None, :] + 0.5) * np.arange(1, SPK_COEFFS + 1)[:, None])  # c1..c20
+    return (logmel @ dct.T).mean(axis=0)
+
+
+class SpeakerTracker:
+    """Gives each voice heard in a match a number (1, 2, ...) by online
+    clustering of voice fingerprints. A rough guide, not an identification:
+    similar voices can be merged and a speaker's voice can drift. 0 = not
+    enough speech to tell."""
+
+    def __init__(self, np, scale=None, threshold=SPK_THRESHOLD, max_speakers=6):
+        self.np = np
+        self.scale = np.asarray(SPK_SCALE if scale is None else scale, dtype=np.float32)
+        self.threshold = threshold
+        self.lock = threading.Lock()  # reset() comes from another thread than assign()
+        self.max_speakers = max_speakers
+        self.centroids = []
+        self.counts = []
+
+    def reset(self):
+        """Forget all voices (a new match starts)."""
+        with self.lock:
+            self.centroids, self.counts = [], []
+
+    def assign_features(self, f):
+        if f is None:
+            return 0
+        with self.lock:
+            return self._assign(f)
+
+    def _assign(self, f):
+        np = self.np
+        z = f / self.scale
+        if self.centroids:
+            d = [float(np.linalg.norm(z - c)) / np.sqrt(len(z)) for c in self.centroids]
+            best = int(np.argmin(d))
+            if d[best] < self.threshold or len(self.centroids) >= self.max_speakers:
+                self.counts[best] += 1
+                w = max(1.0 / self.counts[best], 0.15)  # slowly follows a voice that drifts
+                self.centroids[best] = self.centroids[best] + w * (z - self.centroids[best])
+                return best + 1
+        self.centroids.append(z.astype(np.float32))
+        self.counts.append(1)
+        return len(self.centroids)
+
+    def assign(self, audio):
+        return self.assign_features(speaker_features(self.np, audio))
+
+
+# --------------------------------------------------------------------------
 # Speech recognition
 # --------------------------------------------------------------------------
 
@@ -997,7 +1102,7 @@ class PartialSlot:
             return self.item
 
 
-def asr_loop(model, args, jobs, np=None, rnnoise=None, partials=None):
+def asr_loop(model, args, jobs, np=None, rnnoise=None, partials=None, tracker=None):
     """Transcribe queued utterances. With `partials` (streaming), the time
     between jobs is used to decode the speech still being spoken, so the
     host can show text before the sentence ends; final jobs always go first."""
@@ -1052,7 +1157,8 @@ def asr_loop(model, args, jobs, np=None, rnnoise=None, partials=None):
                 if not text:
                     continue
                 found = True
-                emit("transcript", source=source, text=text, utterance=utt,
+                speaker = tracker.assign(piece) if tracker is not None else 0
+                emit("transcript", source=source, text=text, utterance=utt, speaker=speaker,
                      language=language, language_probability=round(probability, 3),
                      audio_seconds=round(len(piece) / SAMPLE_RATE, 2), processing_seconds=round(took, 2))
         except Exception as e:
@@ -1203,6 +1309,8 @@ def main():
                     help="live mode: transcribe after this much continuous speech even without a pause")
     ap.add_argument("--app-audio", default="",
                     help="Windows: capture only this program's audio (e.g. cs2.exe) while it is running")
+    ap.add_argument("--speakers", action="store_true",
+                    help="number the voices heard (1, 2, ...) with a cheap voice fingerprint; a rough guide")
     ap.add_argument("--stream", action="store_true",
                     help="live mode: also report what is being said before the sentence ends (LocalAgreement-2)")
     ap.add_argument("--denoise", action="store_true", help="suppress noise (RNNoise) before voice detection")
@@ -1267,6 +1375,7 @@ def main():
     if args.denoise and rnnoise is None:
         emit("warning", message="noise suppression is not available on this system; continuing without it")
 
+    tracker = SpeakerTracker(np) if args.speakers else None
     partials = PartialSlot() if args.live and args.stream else None
     segmenter = None
     if args.live:
@@ -1276,7 +1385,7 @@ def main():
     if sc is not None:
         threading.Thread(target=capture_loop, args=(sc, np, args, ring, segmenter, stop), daemon=True).start()
 
-    asr = threading.Thread(target=asr_loop, args=(model, args, jobs, np, rnnoise, partials), daemon=True)
+    asr = threading.Thread(target=asr_loop, args=(model, args, jobs, np, rnnoise, partials, tracker), daemon=True)
     asr.start()
 
     nmt_jobs = None
@@ -1301,6 +1410,9 @@ def main():
         elif cmd[0] == "prompt":
             # "prompt <text>": vocabulary hint for Whisper (e.g. the map's callouts)
             set_prompt(line.strip()[len("prompt"):])
+        elif cmd[0] == "speakers" and cmd[1:2] == ["reset"]:
+            if tracker is not None:
+                tracker.reset()  # a new match: forget the voices
         elif cmd[0] == "translate" and len(cmd) >= 4:
             # "translate <id> <lang> <text>"; without fast translation enabled
             # the host is told right away to use the LLM

@@ -59,6 +59,9 @@ type Config struct {
 	// transcribed. Before the program starts, or if that isn't possible, the
 	// worker records everything the user hears. Ignored with AudioDevice.
 	AppAudio string
+	// Speakers numbers the voices heard (Transcript.Speaker) with a cheap voice
+	// fingerprint. A rough guide: similar voices can be merged.
+	Speakers bool
 	// Stream (live mode) also reports what is being said while the speaker is
 	// still talking (KindPartial), using LocalAgreement-2. It decodes the
 	// speech again about once a second, so it costs extra CPU.
@@ -103,6 +106,7 @@ type Transcript struct {
 	Source              string  `json:"source"` // "live" or "capture"
 	Text                string  `json:"text"`
 	Tentative           string  `json:"tentative"` // KindPartial: words that may still change
+	Speaker             int     `json:"speaker"`   // 1, 2, ... a voice heard in this match; 0 = unknown / not tracked
 	Utterance           int     `json:"utterance"` // live: which utterance (partials and its final share it)
 	Language            string  `json:"language"`
 	LanguageProbability float64 `json:"language_probability"`
@@ -258,6 +262,9 @@ func (c Config) command(ctx context.Context, extra ...string) (*exec.Cmd, error)
 	}
 	if c.AppAudio != "" && !strings.EqualFold(c.AppAudio, "off") && c.AudioDevice == "" {
 		args = append(args, "--app-audio", c.AppAudio)
+	}
+	if c.Speakers {
+		args = append(args, "--speakers")
 	}
 	if c.Denoise {
 		args = append(args, "--denoise")
@@ -559,6 +566,9 @@ func (w *Worker) forget(id int) {
 	delete(w.pending, id)
 	w.mu.Unlock()
 }
+
+// ResetSpeakers forgets the voices heard so far (a new match starts).
+func (w *Worker) ResetSpeakers() error { return w.send("speakers reset") }
 
 // SetPrompt gives Whisper a vocabulary hint (e.g. the current map's callouts).
 func (w *Worker) SetPrompt(text string) error {

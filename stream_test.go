@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -45,5 +46,25 @@ func TestClearHearingOnlyForItsUtterance(t *testing.T) {
 	s.clearHearing(audio.Transcript{Source: "live", Utterance: 5})
 	if s.busy.hearing != "" {
 		t.Errorf("hearing = %q", s.busy.hearing)
+	}
+}
+
+func TestSpeakerStyle(t *testing.T) {
+	if tag, on, off := speakerStyle(0); tag != "" || on != "" || off != "" {
+		t.Errorf("unknown speaker styled: %q %q %q", tag, on, off)
+	}
+	seen := map[string]bool{}
+	for n := 1; n <= len(speakerColors); n++ {
+		tag, on, off := speakerStyle(n)
+		if tag != fmt.Sprintf("P%d", n) || off != "\033[0m" || seen[on] {
+			t.Errorf("speaker %d: %q %q %q (duplicate colour: %v)", n, tag, on, off, seen[on])
+		}
+		if on == "\033[92m" {
+			t.Errorf("speaker %d uses the translation green", n)
+		}
+		seen[on] = true
+	}
+	if _, on, _ := speakerStyle(len(speakerColors) + 1); on != "\033["+fmt.Sprint(speakerColors[0])+"m" {
+		t.Error("colours should cycle beyond the palette")
 	}
 }

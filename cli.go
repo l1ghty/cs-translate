@@ -252,7 +252,24 @@ func (v *voiceTranslator) contextText(now time.Time) string {
 }
 
 func (v *voiceTranslator) printOriginal(t audio.Transcript) {
-	ui.Printf("\nVoice [%s, %.1fs audio, recognised in %.2fs]: %s\n", t.Language, t.AudioSeconds, t.ProcessingSeconds, t.Text)
+	tag, on, off := speakerStyle(t.Speaker)
+	if tag != "" {
+		tag += ", "
+	}
+	ui.Printf("\n%sVoice [%s%s, %.1fs audio, recognised in %.2fs]: %s%s\n", on, tag, t.Language, t.AudioSeconds, t.ProcessingSeconds, t.Text, off)
+}
+
+// speakerColors are readable on dark and light terminals and none is the
+// green used for translations.
+var speakerColors = []int{96, 93, 95, 91, 94, 97} // cyan, yellow, magenta, red, blue, white
+
+// speakerStyle returns the tag ("P2") and the ANSI codes that colour speaker
+// n's lines; all empty when the speaker is unknown (0).
+func speakerStyle(n int) (tag, on, off string) {
+	if n <= 0 {
+		return "", "", ""
+	}
+	return fmt.Sprintf("P%d", n), fmt.Sprintf("\033[%dm", speakerColors[(n-1)%len(speakerColors)]), "\033[0m"
 }
 
 // printTranslation translates t and prints the result (nothing if t is
@@ -264,6 +281,10 @@ func (v *voiceTranslator) printTranslation(ctx context.Context, t audio.Transcri
 		tag := ""
 		if via != "" {
 			tag = ", " + via
+		}
+		if sp, on, off := speakerStyle(t.Speaker); sp != "" {
+			ui.Printf("\033[1m%s%s Translated (%.2fs%s): %s%s\n", on, sp, time.Since(start).Seconds(), tag, translated, off)
+			return
 		}
 		ui.Printf("\033[1;32mTranslated (%.2fs%s): %s\033[0m\n", time.Since(start).Seconds(), tag, translated)
 	}

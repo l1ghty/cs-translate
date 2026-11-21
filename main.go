@@ -42,6 +42,7 @@ func main() {
 	voiceInterval := flag.Int("voice-interval", 5, "Live voice: transcribe after this many seconds of speech even if the speaker hasn't paused yet")
 	fastTranslate := flag.Bool("fast-translate", true, "Voice: translate short callouts to English with a small offline model (no LLM, no GPU); falls back to the LLM when unavailable")
 	voiceStream := flag.Bool("voice-stream", false, "Live voice: show what is being said while the speaker is still talking (uses extra CPU)")
+	speakers := flag.Bool("speakers", false, "Voice: give each voice a number and colour (P1, P2, ...) so you can tell speakers apart; a rough guide only")
 	appAudio := flag.String("app-audio", "cs2.exe", "Windows: record only this program's audio while it runs, so Discord/music aren't transcribed ('off' = everything you hear)")
 	denoise := flag.Bool("denoise", true, "Voice: suppress game noise (gunfire, ambience) with RNNoise before recognising speech")
 	translateCPU := flag.Bool("translate-cpu", false, "Run the translation model on the CPU only, keeping the GPU free for the game")
@@ -61,6 +62,7 @@ func main() {
 		BufferSecs:  captureSeconds * 2,
 		Denoise:     *denoise,
 		Stream:      *voiceStream,
+		Speakers:    *speakers,
 		AppAudio:    *appAudio,
 
 		FastLanguages: fastLanguages(*voiceLang),
@@ -459,6 +461,7 @@ func (s *session) mapLine(text string) {
 		log.Printf("Could not set the speech vocabulary for %s: %v", m, err)
 		return
 	}
+	s.worker.ResetSpeakers() // a new match: the same teammates may sit in other slots
 	ui.Printf("Map: %s (speech vocabulary updated)\n", m)
 }
 
