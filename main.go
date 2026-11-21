@@ -41,6 +41,7 @@ func main() {
 	voiceLang := flag.String("voice-lang", "", "Language(s) spoken in voice chat: one code (ru) or a list (ru,en,de) to keep detection within them (default: auto-detect)")
 	voiceInterval := flag.Int("voice-interval", 5, "Live voice: transcribe after this many seconds of speech even if the speaker hasn't paused yet")
 	fastTranslate := flag.Bool("fast-translate", true, "Voice: translate short callouts to English with a small offline model (no LLM, no GPU); falls back to the LLM when unavailable")
+	denoise := flag.Bool("denoise", true, "Voice: suppress game noise (gunfire, ambience) with RNNoise before recognising speech")
 	translateCPU := flag.Bool("translate-cpu", false, "Run the translation model on the CPU only, keeping the GPU free for the game")
 	setupOnly := flag.Bool("setup", false, "Install and download everything needed, then exit")
 	assumeYes := flag.Bool("yes", false, "Answer 'yes' to all setup questions (unattended install)")
@@ -56,6 +57,7 @@ func main() {
 		Language:    *voiceLang,
 		AudioDevice: *audioDevice,
 		BufferSecs:  captureSeconds * 2,
+		Denoise:     *denoise,
 
 		FastLanguages: fastLanguages(*voiceLang),
 

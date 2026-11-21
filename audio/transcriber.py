@@ -6,7 +6,14 @@
 #   "soundcard>=0.4.4",
 #   "numpy>=1.26",
 #   "msvc-runtime; sys_platform == 'win32'",
+#   # RNNoise denoiser (ships librnnoise as a wheel). Only platforms that have a
+#   # wheel, or uv could not resolve the script at all.
+#   "pyrnnoise>=0.4.6,<0.5; (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64'))",
 # ]
+# # pyrnnoise declares ffmpeg/matplotlib dependencies for its file tools; only its
+# # small ctypes wrapper is used here.
+# [tool.uv]
+# exclude-dependencies = ["audiolab", "av", "matplotlib", "soxr", "soundfile", "smart-open", "jinja2", "humanize", "requests", "click"]
 # ///
 """cs-translate speech worker.
 
@@ -351,6 +358,111 @@ class VadSegmenter:
             self.on_utterance(audio)
 
 
+# --------------------------------------------------------------------------
+# Noise suppression (RNNoise)
+# --------------------------------------------------------------------------
+
+RNNOISE_RATE = 48000
+RNNOISE_FRAME = 480  # 10 ms at 48 kHz
+_UP = RNNOISE_RATE // SAMPLE_RATE  # 3
+
+
+def load_rnnoise():
+    """Load pyrnnoise's small ctypes wrapper without importing the package
+    (whose __init__ needs ffmpeg bindings that aren't installed). None if the
+    library isn't available on this platform."""
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("pyrnnoise")  # finds the package without running it
+        if spec is None or not spec.submodule_search_locations:
+            return None
+        path = os.path.join(list(spec.submodule_search_locations)[0], "rnnoise.py")
+        mod_spec = importlib.util.spec_from_file_location("_cs_rnnoise", path)
+        mod = importlib.util.module_from_spec(mod_spec)
+        mod_spec.loader.exec_module(mod)
+        return mod
+    except Exception as e:
+        log(f"RNNoise unavailable ({type(e).__name__}: {e})")
+        return None
+
+
+class Denoiser:
+    """RNNoise noise suppression for 16 kHz mono float32 audio (one instance
+    per clip; chunks may also be streamed through process()).
+
+    RNNoise works on 10 ms frames at 48 kHz, so audio is upsampled 3x (linear),
+    denoised, then low-passed and decimated back to 16 kHz. It removes steady
+    noise (gunfire spray, ambience, ringing)."""
+
+    TAPS = 64
+
+    def __init__(self, np, rnnoise):
+        self.np = np
+        self.rn = rnnoise
+        self.state = rnnoise.create()
+        n = np.arange(self.TAPS) - (self.TAPS - 1) / 2
+        h = np.sinc(2 * 7600 / RNNOISE_RATE * n) * np.hanning(self.TAPS)  # 7.6 kHz low-pass
+        self.h = (h / h.sum()).astype(np.float32)
+        self.pending = np.zeros(0, dtype=np.float32)       # 16 kHz samples not yet a full frame
+        self.prev = np.float32(0.0)                         # last input sample (interpolation)
+        self.tail = np.zeros(self.TAPS - 1, dtype=np.float32)  # last 48 kHz samples (filter history)
+
+    def __del__(self):
+        try:
+            self.rn.destroy(self.state)
+        except Exception:
+            pass
+
+    def process(self, x):
+        """Denoise a chunk; returns the samples that are ready (may be fewer or
+        more than given, because audio is handled in 10 ms frames)."""
+        np = self.np
+        if len(self.pending):
+            x = np.concatenate((self.pending, x))
+        frame16 = RNNOISE_FRAME // _UP
+        n = len(x) // frame16 * frame16
+        self.pending = x[n:].copy()
+        if n == 0:
+            return np.zeros(0, dtype=np.float32)
+        x = x[:n]
+        ext = np.concatenate(([self.prev], x))
+        a, b = ext[:-1], ext[1:]
+        self.prev = x[-1]
+        up = (a[:, None] + (b - a)[:, None] * np.array([1 / 3, 2 / 3, 1.0], dtype=np.float32)).ravel()
+        buf = np.ascontiguousarray(up * 32768.0, dtype=np.float32)  # RNNoise wants int16-range floats
+        import ctypes
+
+        fptr = ctypes.POINTER(ctypes.c_float)
+        for i in range(0, len(buf), RNNOISE_FRAME):
+            frame = buf[i:i + RNNOISE_FRAME]
+            self.rn.lib.rnnoise_process_frame(self.state, frame.ctypes.data_as(fptr), frame.ctypes.data_as(fptr))
+        buf /= 32768.0
+        ext48 = np.concatenate((self.tail, buf))
+        self.tail = ext48[-(self.TAPS - 1):].copy()
+        filtered = np.convolve(ext48, self.h, mode="valid")  # same length as buf
+        return np.clip(filtered[::_UP], -1.0, 1.0).astype(np.float32)
+
+    def process_all(self, x):  # noqa: D401
+        """Denoise a complete clip (e.g. an F9 capture) and return it at its original length."""
+        np = self.np
+        out = self.process(np.concatenate((x, np.zeros(RNNOISE_FRAME // _UP, dtype=np.float32))))
+        return out[: len(x)] if len(out) >= len(x) else np.concatenate((out, np.zeros(len(x) - len(out), dtype=np.float32)))
+
+
+def denoise(np, rnnoise, audio):
+    """Clean one utterance or capture before Whisper. Done on the audio that is
+    transcribed only, never on the continuous stream: RNNoise costs ~6% of a
+    core when running all the time, but this runs only while someone talks."""
+    if rnnoise is None or len(audio) == 0:
+        return audio
+    try:
+        return Denoiser(np, rnnoise).process_all(audio)
+    except Exception as e:  # never fatal: fall back to the raw audio
+        log(f"noise suppression failed: {e}")
+        return audio
+
+
 def capture_loop(sc, np, args, ring, segmenter, stop):
     block = SAMPLE_RATE // 10  # 100 ms per read keeps wake-ups (and CPU) low
     warned = False
@@ -591,7 +703,7 @@ def parse_languages(spec):
     return [l.strip().lower() for l in spec.split(",") if l.strip()]
 
 
-def asr_loop(model, args, jobs):
+def asr_loop(model, args, jobs, np=None, rnnoise=None):
     languages = parse_languages(args.language)
     while True:
         source, audio = jobs.get()
@@ -599,6 +711,7 @@ def asr_loop(model, args, jobs):
             return
         found = False
         try:
+            audio = denoise(np, rnnoise, audio)
             pieces = split_speech(audio) if source == "capture" else [audio]
             emit("job_start", source=source, pieces=len(pieces))
             for piece in pieces:
@@ -756,6 +869,7 @@ def main():
     ap.add_argument("--buffer-seconds", type=float, default=30.0)
     ap.add_argument("--max-speech-seconds", type=float, default=5.0,
                     help="live mode: transcribe after this much continuous speech even without a pause")
+    ap.add_argument("--denoise", action="store_true", help="suppress noise (RNNoise) before voice detection")
     ap.add_argument("--nmt-langs", default="",
                     help="enable fast offline translation to English for these languages (comma-separated); "
                         "their models are downloaded at startup / --prepare")
@@ -813,12 +927,16 @@ def main():
                 break
         jobs.put(("live", audio))
 
+    rnnoise = load_rnnoise() if args.denoise else None
+    if args.denoise and rnnoise is None:
+        emit("warning", message="noise suppression is not available on this system; continuing without it")
+
     segmenter = VadSegmenter(np, on_utterance, max_speech_s=max(args.max_speech_seconds, 1.0)) if args.live else None
 
     if sc is not None:
         threading.Thread(target=capture_loop, args=(sc, np, args, ring, segmenter, stop), daemon=True).start()
 
-    asr = threading.Thread(target=asr_loop, args=(model, args, jobs), daemon=True)
+    asr = threading.Thread(target=asr_loop, args=(model, args, jobs, np, rnnoise), daemon=True)
     asr.start()
 
     nmt_jobs = None

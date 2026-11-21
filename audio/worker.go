@@ -54,6 +54,10 @@ type Config struct {
 	// MaxSpeechSecs (live mode) transcribes an utterance once it is this
 	// long, even if the speaker hasn't paused yet; 0 = the worker's default.
 	MaxSpeechSecs int
+	// Denoise cleans speech with RNNoise before it is transcribed (only the
+	// audio that is transcribed, so there is no load while nobody talks). It
+	// is skipped with a warning where RNNoise isn't available (macOS < 26).
+	Denoise bool
 	// FastTranslate enables the worker's offline Opus-MT translation to
 	// English (Worker.Translate). The models of FastLanguages (default:
 	// DefaultFastLanguages) are downloaded when the worker starts or is
@@ -236,6 +240,9 @@ func (c Config) command(ctx context.Context, extra ...string) (*exec.Cmd, error)
 		if c.MaxSpeechSecs > 0 {
 			args = append(args, "--max-speech-seconds", strconv.Itoa(c.MaxSpeechSecs))
 		}
+	}
+	if c.Denoise {
+		args = append(args, "--denoise")
 	}
 	if c.FastTranslate {
 		args = append(args, "--nmt-langs", strings.Join(c.Resolve().FastLanguages, ","))

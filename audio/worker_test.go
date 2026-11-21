@@ -249,3 +249,18 @@ func TestCommandPassesFastLanguages(t *testing.T) {
 		t.Errorf("args = %v", cmd.Args)
 	}
 }
+
+func TestCommandPassesDenoise(t *testing.T) {
+	c := Config{UV: "uv", DataDir: t.TempDir(), Model: "tiny"}
+	args := func() string {
+		cmd, _ := c.command(context.Background())
+		return strings.Join(cmd.Args, " ")
+	}
+	if strings.Contains(args(), "--denoise") {
+		t.Error("--denoise passed although off")
+	}
+	c.Denoise = true
+	if !strings.Contains(args(), "--denoise") {
+		t.Error("--denoise not passed")
+	}
+}
